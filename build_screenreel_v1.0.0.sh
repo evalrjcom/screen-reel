@@ -86,7 +86,8 @@ alpine_inner() {
         command -v "musl-$c" >/dev/null 2>&1 || ln -sf "$(command -v $c)" "/usr/local/bin/musl-$c"
     done
     export CC_x86_64_unknown_linux_musl=gcc CXX_x86_64_unknown_linux_musl=g++
-    RF="-C target-feature=+crt-static"
+    # Non-PIE fully static: with -static every -l resolves to a .a, never libc.so.
+    RF="-C target-feature=+crt-static -C relocation-model=static -C link-arg=-static"
     # Static archives are order-sensitive: resolve the whole X/font/runtime stack as one
     # linker group (Xft->Xrender->Xext->X11->xcb..., libgcc for __popcountdi2, libc last).
     RF="$RF -C link-arg=-Wl,--start-group"
@@ -98,7 +99,11 @@ alpine_inner() {
     out="/src/dist/${TAG}-linux-x86_64-static"
     cp /src/target-musl/x86_64-unknown-linux-musl/release/screenreel "$out"
     file "$out" 2>/dev/null || true
-    if ldd "$out" 2>&1 | grep -q '=>'; then die "binary is not fully static"; fi
+    readelf -lW "$out" | grep -i interp || true
+    readelf -dW "$out" | grep NEEDED || true
+    if readelf -lW "$out" | grep -qi 'INTERP' || readelf -dW "$out" | grep -q NEEDED; then
+        die "binary is not fully static"
+    fi
     log "fully static: $out"
 }
 
