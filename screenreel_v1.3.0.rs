@@ -1,5 +1,5 @@
-//! ScreenReel v1.2.0 — lightweight screen recorder + editor (Rust + FLTK)
-//! File: screenreel_v1.2.0.rs
+//! ScreenReel v1.3.0 — lightweight screen recorder + editor (Rust + FLTK)
+//! File: screenreel_v1.3.0.rs
 //!
 //! Design summary
 //! --------------
@@ -15,6 +15,11 @@
 //!
 //! Changelog
 //! ---------
+//! 1.3.0  Opto compressor (CL 1B-style: soft-knee optical cell with program-dependent
+//!        release + tube make-up stage) with presets, transfer curve and A/B audition.
+//!        Normalize levels: BS.1770 gated LUFS per track to a target with a look-ahead
+//!        -1 dBFS limiter. Output peak meter; soft -1 dBFS ceiling replaces hard clipping
+//!        in playback/export. UI: all controls in one grouped dark dock under the preview.
 //! 1.2.0  MOV/MP4 fix: ffmpeg is found beyond PATH (env override, saved choice, exe dir,
 //!        WinGet/Scoop/Chocolatey/Program Files) with a Locate dialog; CREATE_NO_WINDOW.
 //!        New project (button + Ctrl+N) with unsaved-changes guard (also on Open).
@@ -51,12 +56,12 @@ use cpal::{FromSample, Sample, SizedSample};
 use fltk::{
     app, button::{Button, CheckButton}, dialog, draw, enums::{Align, Color, Cursor, Event, Font, FrameType, Key, Shortcut},
     frame::Frame, group::Flex, image::RgbImage, menu::Choice, misc::Spinner, prelude::*,
-    valuator::HorNiceSlider, window::Window,
+    valuator::{HorNiceSlider, HorValueSlider}, window::Window,
 };
 
 // Every in-file version reference derives from these two constants (bump together).
-const VERSION: &str = "1.2.0";
-const FILE_TAG: &str = "screenreel_v1.2.0";
+const VERSION: &str = "1.3.0";
+const FILE_TAG: &str = "screenreel_v1.3.0";
 const APP_NAME: &str = "ScreenReel";
 const AR: u32 = 48_000; // canonical project audio rate
 const FPS_CHOICES: [u32; 8] = [10, 15, 20, 24, 25, 30, 50, 60]; // all divide 48000 exactly
@@ -1610,16 +1615,208 @@ impl Project {
 }
 
 // =====================================================================================
+// Audio FX: CL 1B-style opto compressor + BS.1770 loudness normalization
+// =====================================================================================
+
+/// Opto compressor parameters (modelled on the behaviour of a Tube-Tech CL 1B: optical
+/// gain cell with program-dependent two-stage release, soft knee, tube make-up stage).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OptoParams { threshold_db: f32, ratio: f32, attack_ms: f32, release_s: f32, warmth: f32, makeup_db: f32 }
+
+const OPTO_PRESETS: [(&str, OptoParams); 5] = [
+    ("Voice - gentle 2:1", OptoParams { threshold_db: -20.0, ratio: 2.0, attack_ms: 10.0, release_s: 0.40, warmth: 0.35, makeup_db: 4.0 }),
+    ("Voice - leveling 4:1", OptoParams { threshold_db: -26.0, ratio: 4.0, attack_ms: 5.0, release_s: 0.60, warmth: 0.40, makeup_db: 7.0 }),
+    ("Broadcast 6:1", OptoParams { threshold_db: -30.0, ratio: 6.0, attack_ms: 2.0, release_s: 0.30, warmth: 0.50, makeup_db: 10.0 }),
+    ("Warm glue 1.5:1", OptoParams { threshold_db: -16.0, ratio: 1.5, attack_ms: 30.0, release_s: 1.00, warmth: 0.60, makeup_db: 2.0 }),
+    ("Peak tamer 10:1", OptoParams { threshold_db: -10.0, ratio: 10.0, attack_ms: 1.0, release_s: 0.15, warmth: 0.20, makeup_db: 2.0 }),
+];
+
+const OPTO_KNEE_DB: f32 = 8.0; // opto cells have a very soft knee
+
+impl OptoParams {
+    /// Static gain reduction (dB, >= 0) for a detector level, soft knee.
+    fn static_gr(&self, lvl_db: f32) -> f32 {
+        let over = lvl_db - self.threshold_db;
+        let k = OPTO_KNEE_DB;
+        let slope = 1.0 - 1.0 / self.ratio.max(1.0);
+        if 2.0 * over <= -k { 0.0 } else if 2.0 * over < k { slope * (over + k / 2.0).powi(2) / (2.0 * k) } else { slope * over }
+    }
+    fn sanitized(mut self) -> Self {
+        let fix = |v: f32, lo: f32, hi: f32, d: f32| if v.is_finite() { v.clamp(lo, hi) } else { d };
+        self.threshold_db = fix(self.threshold_db, -60.0, 0.0, -20.0);
+        self.ratio = fix(self.ratio, 1.0, 20.0, 2.0);
+        self.attack_ms = fix(self.attack_ms, 0.5, 200.0, 10.0);
+        self.release_s = fix(self.release_s, 0.05, 5.0, 0.4);
+        self.warmth = fix(self.warmth, 0.0, 1.0, 0.3);
+        self.makeup_db = fix(self.makeup_db, -12.0, 24.0, 0.0);
+        self
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+struct FxStats { max_gr_db: f32, avg_gr_db: f32, in_peak: f32, out_peak: f32 }
+
+/// Offline opto compression of interleaved 48 kHz PCM. O(n), one log + one exp per frame.
+/// Detector: stereo-linked mean-square (2 ms) -> soft-knee curve -> opto smoothing where the
+/// release slows down the longer/deeper the cell has been driven (T4 "memory"), giving the
+/// characteristic fast-then-slow, pump-free release. Then a tube make-up stage: asymmetric
+/// tanh (adds mostly 2nd harmonic, scaled by `warmth`, unity small-signal gain) + DC blocker.
+fn opto_compress(x: &[i16], ch: usize, p: OptoParams) -> (Vec<i16>, FxStats) {
+    let p = p.sanitized();
+    let ch = ch.max(1);
+    let fs = AR as f32;
+    let a_det = 1.0 - (-1.0 / (0.002 * fs)).exp();
+    let a_att = 1.0 - (-1.0 / (p.attack_ms * 0.001 * fs)).exp();
+    let a_mem = 1.0 / (2.5 * fs); // cell memory builds/decays over ~2.5 s
+    let makeup = 10f32.powf(p.makeup_db / 20.0);
+    // tube stage: drive and bias grow with warmth; normalised so small signals pass at unity
+    let drive = 1.0 + 2.5 * p.warmth;
+    let bias = 0.22 * p.warmth;
+    let tb = bias.tanh();
+    let norm = drive * (1.0 - tb * tb);
+    let a_dc = 1.0 - (-std::f32::consts::TAU * 8.0 / fs).exp(); // 8 Hz DC blocker
+    let (mut ms, mut gr, mut mem) = (0f32, 0f32, 0f32);
+    let mut dc = vec![0f32; ch];
+    let mut out = Vec::with_capacity(x.len());
+    let mut st = FxStats::default();
+    let (mut gr_sum, mut gr_n) = (0f64, 0u64);
+    for fr in x.chunks_exact(ch) {
+        let mut sq = 0f32;
+        for &v in fr { let f = v as f32 / 32768.0; sq = sq.max(f * f); st.in_peak = st.in_peak.max(f.abs()); }
+        ms += (sq - ms) * a_det;
+        // +3 dB: report the detector in "peak-equivalent" dB for sine-like material
+        let lvl = 10.0 * (ms + 1e-12).log10() + 3.01;
+        let target = p.static_gr(lvl);
+        if target > gr { gr += (target - gr) * a_att; } else {
+            let tau = (p.release_s * (0.25 + 0.75 * mem)).max(0.04); // program-dependent release
+            gr += (target - gr) / (tau * fs);
+        }
+        mem += ((gr / 8.0).min(1.0) - mem) * a_mem;
+        if gr > 0.5 { gr_sum += gr as f64; gr_n += 1; }
+        st.max_gr_db = st.max_gr_db.max(gr);
+        let g = 10f32.powf(-gr / 20.0) * makeup;
+        for (c, &v) in fr.iter().enumerate() {
+            let y = v as f32 / 32768.0 * g;
+            let t = if p.warmth > 0.0 { ((y * drive + bias).tanh() - tb) / norm } else { y };
+            dc[c] += (t - dc[c]) * a_dc;
+            let o = t - dc[c];
+            st.out_peak = st.out_peak.max(o.abs());
+            out.push(f2i(o));
+        }
+    }
+    st.avg_gr_db = if gr_n > 0 { (gr_sum / gr_n as f64) as f32 } else { 0.0 };
+    (out, st)
+}
+
+/// ITU-R BS.1770-4 K-weighting biquad (48 kHz coefficients), transposed direct form II.
+#[derive(Clone, Copy)]
+struct Biquad { b: [f64; 3], a: [f64; 2], z: [f64; 2] }
+impl Biquad {
+    fn new(b: [f64; 3], a: [f64; 2]) -> Self { Biquad { b, a, z: [0.0; 2] } }
+    #[inline] fn run(&mut self, x: f64) -> f64 {
+        let y = self.b[0] * x + self.z[0];
+        self.z[0] = self.b[1] * x - self.a[0] * y + self.z[1];
+        self.z[1] = self.b[2] * x - self.a[1] * y;
+        y
+    }
+}
+
+/// Integrated loudness (LUFS) of interleaved PCM with BS.1770 gating (400 ms blocks, 75 %
+/// overlap, -70 LUFS absolute and -10 LU relative gates). A mono track is measured as the
+/// dual-mono signal it becomes in the stereo mix, so mono mic and stereo system tracks end up
+/// equally loud when normalised to the same target. None = silent (no block passes the gate).
+fn loudness_lufs(x: &[i16], ch: usize) -> Option<f64> {
+    let ch = ch.max(1);
+    let n = x.len() / ch;
+    let (blk, hop) = (AR as usize * 4 / 10, AR as usize / 10);
+    if n < blk { return None; }
+    let mk = || (Biquad::new([1.53512485958697, -2.69169618940638, 1.19839281085285], [-1.69065929318241, 0.73248077421585]),
+                 Biquad::new([1.0, -2.0, 1.0], [-1.99004745483398, 0.99007225036621]));
+    let mut f: Vec<(Biquad, Biquad)> = (0..ch).map(|_| mk()).collect();
+    // per-100 ms sums of K-weighted squares (channel-summed), blocks = 4 consecutive hops
+    let mut hops: Vec<f64> = Vec::with_capacity(n / hop + 1);
+    let mut acc = 0f64;
+    for i in 0..n {
+        for (c, (s1, s2)) in f.iter_mut().enumerate() {
+            let v = s2.run(s1.run(x[i * ch + c] as f64 / 32768.0));
+            acc += v * v;
+        }
+        if (i + 1) % hop == 0 { hops.push(acc); acc = 0.0; }
+    }
+    let dual = if ch == 1 { 2.0 } else { 1.0 };
+    let blocks: Vec<f64> = hops.windows(4).map(|w| w.iter().sum::<f64>() / blk as f64 * dual).collect();
+    let lk = |z: f64| -0.691 + 10.0 * z.max(1e-20).log10();
+    let abs: Vec<f64> = blocks.into_iter().filter(|&z| lk(z) > -70.0).collect();
+    if abs.is_empty() { return None; }
+    let rel = lk(abs.iter().sum::<f64>() / abs.len() as f64) - 10.0;
+    let g: Vec<f64> = abs.into_iter().filter(|&z| lk(z) > rel).collect();
+    if g.is_empty() { return None; }
+    Some(lk(g.iter().sum::<f64>() / g.len() as f64))
+}
+
+/// Apply a linear gain, then a 2 ms look-ahead / 80 ms release peak limiter so no sample
+/// exceeds `ceiling` (linear). Sliding-window minimum keeps it O(n). Returns the deepest
+/// limiting applied in dB.
+fn gain_with_limiter(x: &[i16], ch: usize, gain: f32, ceiling: f32) -> (Vec<i16>, f32) {
+    let ch = ch.max(1);
+    let n = x.len() / ch;
+    let need: Vec<f32> = x.chunks_exact(ch).map(|fr| {
+        let pk = fr.iter().map(|&v| (v as f32 / 32768.0 * gain).abs()).fold(0f32, f32::max);
+        if pk > ceiling { ceiling / pk } else { 1.0 }
+    }).collect();
+    let la = (AR as usize * 2 / 1000).max(1);
+    // forward sliding min over [i, i+la] using a monotonic deque
+    let mut tgt = vec![1f32; n];
+    let mut dq: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for j in 0..n + la {
+        if j < n { while dq.back().map(|&b| need[b] >= need[j]).unwrap_or(false) { dq.pop_back(); } dq.push_back(j); }
+        if j >= la {
+            let i = j - la;
+            while dq.front().map(|&f| f < i).unwrap_or(false) { dq.pop_front(); }
+            if let Some(&f) = dq.front() { tgt[i] = need[f]; }
+        }
+    }
+    let a_att = 1.0 - (-1.0 / (la as f32 / 3.0)).exp();
+    let a_rel = 1.0 - (-1.0 / (0.080 * AR as f32)).exp();
+    let mut env = 1f32;
+    let mut deepest = 1f32;
+    let mut out = Vec::with_capacity(x.len());
+    for (i, fr) in x.chunks_exact(ch).enumerate() {
+        env += (tgt[i] - env) * if tgt[i] < env { a_att } else { a_rel };
+        let g = env.min(need[i]); // hard guarantee on the sample itself
+        deepest = deepest.min(g);
+        for &v in fr { out.push(f2i(v as f32 / 32768.0 * gain * g)); }
+    }
+    (out, (-20.0 * deepest.max(1e-6).log10()).max(0.0))
+}
+
+/// Smooth safety ceiling for the stereo mix: transparent below -1 dBFS, then a tanh knee
+/// that approaches (never exceeds) full scale. Replaces hard clipping on overs.
+#[inline]
+fn soft_ceiling(x: f32) -> f32 {
+    const K: f32 = 0.891; // -1 dBFS
+    let a = x.abs();
+    if a <= K { x } else { x.signum() * (K + (1.0 - K) * ((a - K) / (1.0 - K)).tanh()) }
+}
+
+// =====================================================================================
 // Mixing + playback engine
 // =====================================================================================
 
 #[derive(Clone)]
 struct MixTrack { data: Arc<Vec<i16>>, ch: u16, gain: f32 }
 
-fn mix_tracks(edit: &Edit, exclude: Option<usize>) -> Vec<MixTrack> {
+fn mix_tracks(edit: &Edit, exclude: Option<usize>) -> Vec<MixTrack> { mix_tracks_with(edit, exclude, None) }
+
+/// Like `mix_tracks`, but track `over.0` plays `over.1` instead of its stored samples
+/// (used to audition an FX result before it is applied; the override is always audible).
+fn mix_tracks_with(edit: &Edit, exclude: Option<usize>, over: Option<&(usize, Arc<Vec<i16>>)>) -> Vec<MixTrack> {
     edit.tracks.iter().enumerate()
-        .filter(|(i, t)| !t.muted && Some(*i) != exclude && t.gain > 0.0)
-        .map(|(_, t)| MixTrack { data: t.data.clone(), ch: t.ch, gain: t.gain }).collect()
+        .filter(|(i, t)| Some(*i) != exclude && (over.map(|o| o.0 == *i).unwrap_or(false) || (!t.muted && t.gain > 0.0)))
+        .map(|(i, t)| match over {
+            Some((oi, d)) if *oi == i => MixTrack { data: d.clone(), ch: t.ch, gain: t.gain.max(0.01) },
+            _ => MixTrack { data: t.data.clone(), ch: t.ch, gain: t.gain },
+        }).collect()
 }
 
 #[inline]
@@ -1640,17 +1837,17 @@ fn mix_bytes(ts: &[MixTrack], start: usize, n: usize, out: &mut Vec<u8>) {
     out.clear();
     for i in start..start + n {
         let (l, r) = mix_frame(ts, i);
-        out.extend_from_slice(&f2i(l).to_le_bytes());
-        out.extend_from_slice(&f2i(r).to_le_bytes());
+        out.extend_from_slice(&f2i(soft_ceiling(l)).to_le_bytes());
+        out.extend_from_slice(&f2i(soft_ceiling(r)).to_le_bytes());
     }
 }
 
 const NO_SEEK: u64 = u64::MAX;
 
-struct PlayShared { playing: AtomicBool, pos: AtomicU64, seek: AtomicU64, end: AtomicU64, mix: Mutex<Vec<MixTrack>> }
+struct PlayShared { playing: AtomicBool, pos: AtomicU64, seek: AtomicU64, end: AtomicU64, mix: Mutex<Vec<MixTrack>>, meter: [AtomicU32; 2] }
 
 impl PlayShared {
-    fn new() -> Self { PlayShared { playing: AtomicBool::new(false), pos: AtomicU64::new(0), seek: AtomicU64::new(NO_SEEK), end: AtomicU64::new(0), mix: Mutex::new(vec![]) } }
+    fn new() -> Self { PlayShared { playing: AtomicBool::new(false), pos: AtomicU64::new(0), seek: AtomicU64::new(NO_SEEK), end: AtomicU64::new(0), mix: Mutex::new(vec![]), meter: [AtomicU32::new(0), AtomicU32::new(0)] } }
     fn seek_to(&self, p: u64) { self.pos.store(p, Relaxed); self.seek.store(p, Release); }
 }
 
@@ -1702,6 +1899,7 @@ where T: SizedSample + FromSample<f32> + Send + 'static {
         // try_lock: never block the real-time thread; a busy lock costs one silent buffer.
         let Ok(ts) = ps.mix.try_lock() else { silent(data); return };
         let end = ps.end.load(Relaxed);
+        let (mut pk_l, mut pk_r) = (0f32, 0f32);
         for fr in data.chunks_mut(ch) {
             if pos >= end { fr.iter_mut().for_each(|x| *x = T::EQUILIBRIUM); ps.playing.store(false, Relaxed); continue; }
             let (l0, r0) = mix_frame(&ts, pos as usize);
@@ -1710,7 +1908,8 @@ where T: SizedSample + FromSample<f32> + Send + 'static {
                 let f = frac as f32;
                 (l0 + (l1 - l0) * f, r0 + (r1 - r0) * f)
             } else { (l0, r0) };
-            let (l, r) = (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0));
+            let (l, r) = (soft_ceiling(l), soft_ceiling(r));
+            pk_l = pk_l.max(l.abs()); pk_r = pk_r.max(r.abs());
             if ch == 1 { fr[0] = T::from_sample((l + r) * 0.5); } else {
                 fr[0] = T::from_sample(l); fr[1] = T::from_sample(r);
                 for x in fr.iter_mut().skip(2) { *x = T::EQUILIBRIUM; }
@@ -1726,6 +1925,9 @@ where T: SizedSample + FromSample<f32> + Send + 'static {
         let lead = ts.playback.saturating_duration_since(ts.callback).as_secs_f64()
             + (data.len() / ch) as f64 / cfg_rate;
         let heard = pos.saturating_sub((lead.min(5.0) * AR as f64) as u64);
+        // level meter: positive f32 bit patterns order like u32, so fetch_max is a float max
+        ps.meter[0].fetch_max(pk_l.to_bits(), Relaxed);
+        ps.meter[1].fetch_max(pk_r.to_bits(), Relaxed);
         ps.pos.store(heard.max(start.min(pos)), Relaxed);
     }, |e| eprintln!("[out] stream error: {e}"), None).map_err(es)
 }
@@ -1950,7 +2152,7 @@ fn export_wav(path: &Path, src: &Source, edit: &Edit) -> Res<()> {
     let n = edit.total() as usize * src.spf();
     let ts = mix_tracks(edit, None);
     let mut out = Vec::with_capacity(n * 2);
-    for i in 0..n { let (l, r) = mix_frame(&ts, i); out.push(f2i(l)); out.push(f2i(r)); }
+    for i in 0..n { let (l, r) = mix_frame(&ts, i); out.push(f2i(soft_ceiling(l))); out.push(f2i(soft_ceiling(r))); }
     write_wav(path, 2, AR, &out)
 }
 
@@ -2111,6 +2313,10 @@ struct App {
     edit_gen: u64, dead: Vec<(u32, u32)>, dead_gen: u64,
     /// Double-Space detection: time of the last Space press and the play state before it.
     space_at: Option<(Instant, bool)>,
+    /// FX audition: track index + processed samples played instead of the stored ones.
+    fx_preview: Option<(usize, Arc<Vec<i16>>)>,
+    /// Output level meter state (linear peak with fall-off, peak-hold value + time).
+    vu: [f32; 2], vu_hold: [(f32, Option<Instant>); 2],
 }
 
 impl App {
@@ -2128,6 +2334,50 @@ impl App {
         self.edit_gen += 1;
     }
 
+    /// Replace one track's samples as an undoable edit (FX apply). Track gain resets to 1.0
+    /// when `reset_gain` (normalization bakes the level into the samples).
+    fn set_track_samples(&mut self, ti: usize, data: Vec<i16>, reset_gain: bool) {
+        self.push_undo();
+        if let Some(t) = self.proj.as_mut().and_then(|p| p.edit.tracks.get_mut(ti)) {
+            t.data = Arc::new(data);
+            if reset_gain { t.gain = 1.0; }
+        }
+        self.after_edit();
+    }
+
+    /// Loudness-normalize tracks to `target` LUFS with a -1 dBFS peak ceiling (look-ahead
+    /// limiter). Scope: the selected track, or every track. One undo step for all tracks.
+    fn op_normalize(&mut self, target: f64, only_selected: bool) -> Res<()> {
+        let p = self.proj.as_ref().ok_or("no project")?;
+        let idx: Vec<usize> = if only_selected { vec![self.sel_track.ok_or("Select a track first")?] } else { (0..p.edit.tracks.len()).collect() };
+        if idx.is_empty() { return Err("No audio tracks to normalize".into()); }
+        let ceiling = 10f32.powf(-1.0 / 20.0);
+        let mut results: Vec<(usize, Vec<i16>)> = Vec::new();
+        let mut report = Vec::new();
+        for &i in &idx {
+            let t = &p.edit.tracks[i];
+            match loudness_lufs(&t.data, t.ch as usize) {
+                None => report.push(format!("{}: silent, skipped", t.name)),
+                Some(l) => {
+                    // cap at +30 dB so a near-silent track is not turned into amplified noise
+                    let g_db = (target - l).clamp(-40.0, 30.0);
+                    let (v, lim) = gain_with_limiter(&t.data, t.ch as usize, 10f32.powf(g_db as f32 / 20.0), ceiling);
+                    report.push(format!("{} {:.1}→{:.0} LUFS ({:+.1} dB{})", t.name, l, target, g_db, if lim > 0.1 { format!(", limited {lim:.1} dB") } else { String::new() }));
+                    results.push((i, v));
+                }
+            }
+        }
+        if !results.is_empty() {
+            self.push_undo();
+            if let Some(p) = self.proj.as_mut() {
+                for (i, v) in results { if let Some(t) = p.edit.tracks.get_mut(i) { t.data = Arc::new(v); t.gain = 1.0; } }
+            }
+            self.after_edit();
+        }
+        self.status = format!("Normalized: {}", report.join(" · "));
+        Ok(())
+    }
+
     fn dead_valid(&self) -> bool { self.dead_gen == self.edit_gen && !self.dead.is_empty() }
 
     /// Replace the open project (New/Open). Stops playback and clears per-project state.
@@ -2135,6 +2385,7 @@ impl App {
         self.set_playing(false);
         let n = p.as_ref().map(|p| p.edit.total()).unwrap_or(0);
         self.proj = p;
+        self.fx_preview = None;
         self.sel = None; self.sel_track = None; self.drag_anchor = None;
         self.scroll = 0.0;
         self.zoom = (tl_w as f64 / n.max(1) as f64).max(1e-4);
@@ -2186,7 +2437,8 @@ impl App {
 
     fn sync_mix(&mut self) {
         let excl = self.narr.as_ref().map(|n| n.track);
-        let (ts, end) = match &self.proj { Some(p) => (mix_tracks(&p.edit, excl), p.edit.total() as u64 * p.src.spf() as u64), None => (vec![], 0) };
+        let over = self.fx_preview.as_ref().filter(|o| self.proj.as_ref().map(|p| o.0 < p.edit.tracks.len()).unwrap_or(false));
+        let (ts, end) = match &self.proj { Some(p) => (mix_tracks_with(&p.edit, excl, over), p.edit.total() as u64 * p.src.spf() as u64), None => (vec![], 0) };
         *self.play.mix.lock().unwrap() = ts;
         self.play.end.store(end, Relaxed);
     }
@@ -2335,6 +2587,8 @@ struct Ui {
     timeline: Frame, status: Frame,
     // v1.2.0
     new: Button, speed: Choice, speed_mute: CheckButton, speed_btn: Button, find_dead: Button, rm_dead: Button, compact: Button,
+    // v1.3.0
+    comp: Button, norm: Button, meter: Frame,
 }
 
 /// Speed choices (x100) shown in the "Speed" menu, in order.
@@ -2489,6 +2743,8 @@ fn refresh(app: &Shared, ui: &Ui) {
     // New/Open are refused while recording/narrating/exporting (checked again in the callback)
     for b in [&mut ui.new, &mut ui.open] { if a.rec.is_none() && !a.rec_pending && !busy { b.activate() } else { b.deactivate() } }
     if has && a.sel.is_some() && !busy { ui.speed_btn.activate() } else { ui.speed_btn.deactivate() }
+    let has_tracks = a.proj.as_ref().map(|p| !p.edit.tracks.is_empty()).unwrap_or(false);
+    for b in [&mut ui.comp, &mut ui.norm] { if has_tracks && !busy { b.activate() } else { b.deactivate() } }
     for b in [&mut ui.find_dead, &mut ui.compact] { if has && total > 0 && !busy { b.activate() } else { b.deactivate() } }
     let dv = a.dead_valid();
     ui.rm_dead.set_label(&if dv { format!("Remove dead air ({})", a.dead.len()) } else { "Remove dead air".to_string() });
@@ -2497,7 +2753,7 @@ fn refresh(app: &Shared, ui: &Ui) {
     if cu && !busy { ui.undo.activate() } else { ui.undo.deactivate() }
     if cr && !busy { ui.redo.activate() } else { ui.redo.deactivate() }
     if has && a.job.is_none() { ui.narr.activate() } else { ui.narr.deactivate() }
-    ui.narr.set_label(if a.narr.is_some() { "■ Stop narration" } else { "● Re-record narration" });
+    ui.narr.set_label(if a.narr.is_some() { "■ Stop" } else { "● Narrate" });
     let st = a.sel_track.is_some() && !busy;
     for b in [&mut ui.mute, &mut ui.shl, &mut ui.shr, &mut ui.replace, &mut ui.remove] { if st { b.activate() } else { b.deactivate() } }
     if st { ui.gain.activate() } else { ui.gain.deactivate() }
@@ -2805,6 +3061,271 @@ fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
     if p.extension().map(|e| e.eq_ignore_ascii_case(ext)).unwrap_or(false) { p } else { let mut s = p.into_os_string(); s.push("."); s.push(ext); PathBuf::from(s) }
 }
 
+// ---- Audio FX dialogs ------------------------------------------------------------------
+
+struct CompDlg { params: OptoParams, done: Option<(OptoParams, Arc<Vec<i16>>, FxStats)>, gen: u64 }
+
+/// Opto compressor dialog: presets, six controls, live transfer curve, A/B audition through
+/// the real playback mixer (the processed track replaces the stored one until Cancel/Apply).
+fn comp_dialog(app: &Shared, ui: &Ui) {
+    let pick = {
+        let mut a = app.borrow_mut();
+        if a.job.is_some() || a.narr.is_some() { return; }
+        let sel = a.sel_track;
+        let Some(p) = a.proj.as_ref() else { return };
+        if p.edit.tracks.is_empty() { None } else {
+            // default target: the selected track, else the mic/narration track, else track 1
+            let ti = sel.filter(|&i| i < p.edit.tracks.len())
+                .or_else(|| p.edit.tracks.iter().position(|t| t.name.starts_with("Mic") || t.name.starts_with("Narration")))
+                .unwrap_or(0);
+            let t = &p.edit.tracks[ti];
+            let r = (ti, t.name.clone(), t.ch as usize, t.data.clone());
+            a.sel_track = Some(ti);
+            Some(r)
+        }
+    };
+    let Some((ti, name, ch, orig)) = pick else { alert("No audio tracks yet. Record with a mic or add an audio file first."); return; };
+    refresh(app, ui);
+
+    let st = std::rc::Rc::new(std::cell::RefCell::new(CompDlg { params: OPTO_PRESETS[0].1, done: None, gen: 0 }));
+    let mut w = Window::default().with_size(640, 410).with_label("Opto Compressor");
+    let mut title = Frame::new(16, 10, 608, 26, None).with_align(Align::Left | Align::Inside);
+    title.set_label(&esc(&format!("Opto compressor (warm CL 1B style)  ·  track: {name}")));
+    title.set_label_font(Font::HelveticaBold); title.set_label_size(15);
+    let mut sub = Frame::new(16, 34, 608, 18, None).with_align(Align::Left | Align::Inside);
+    sub.set_label("Optical gain cell with program-dependent release and a tube make-up stage");
+    sub.set_label_size(11); sub.set_label_color(rgb(C_CAPTION));
+    Frame::new(16, 62, 70, 26, "Preset").with_align(Align::Left | Align::Inside);
+    let mut preset = Choice::new(96, 62, 262, 26, None);
+    for (n, _) in OPTO_PRESETS.iter() { preset.add_choice(n); }
+    preset.set_value(0);
+    preset.set_color(rgb(C_PANEL));
+    type Get = fn(&OptoParams) -> f64;
+    type Set = fn(&mut OptoParams, f64);
+    let specs: [(&str, f64, f64, f64, Get, Set, &str); 6] = [
+        ("Threshold dB", -60.0, 0.0, 0.5, |p| p.threshold_db as f64, |p, v| p.threshold_db = v as f32, "Level where compression starts (soft 8 dB knee)"),
+        ("Ratio", 1.0, 20.0, 0.1, |p| p.ratio as f64, |p, v| p.ratio = v as f32, "Compression ratio above threshold"),
+        ("Attack ms", 0.5, 200.0, 0.5, |p| p.attack_ms as f64, |p, v| p.attack_ms = v as f32, "How fast the cell reacts"),
+        ("Release s", 0.05, 5.0, 0.01, |p| p.release_s as f64, |p, v| p.release_s = v as f32, "Slow release; the opto cell releases slower after long/deep compression"),
+        ("Warmth %", 0.0, 100.0, 1.0, |p| p.warmth as f64 * 100.0, |p, v| p.warmth = (v / 100.0) as f32, "Tube make-up stage: even-harmonic saturation"),
+        ("Make-up dB", -12.0, 24.0, 0.5, |p| p.makeup_db as f64, |p, v| p.makeup_db = v as f32, "Output gain after compression"),
+    ];
+    let mut sliders: Vec<HorValueSlider> = Vec::new();
+    for (k, (lbl, lo, hi, step, get, _, tip)) in specs.iter().enumerate() {
+        let y = 100 + k as i32 * 38;
+        Frame::new(16, y, 96, 28, None).with_label(lbl).with_align(Align::Left | Align::Inside);
+        let mut sl = HorValueSlider::new(116, y, 242, 28, None);
+        sl.set_range(*lo, *hi); sl.set_step(*step, 1); sl.set_value(get(&st.borrow().params));
+        sl.set_tooltip(tip);
+        sl.set_color(rgb(C_FIELD)); sl.set_selection_color(rgb(C_FX)); sl.set_text_color(rgb(C_TEXT)); sl.set_text_size(12);
+        sliders.push(sl);
+    }
+    let mut curve = Frame::new(384, 62, 240, 268, None);
+    let mut stats = Frame::new(16, 336, 608, 20, None).with_align(Align::Left | Align::Inside);
+    stats.set_label_size(12); stats.set_label_color(rgb(C_CAPTION));
+    stats.set_label("Press Audition to hear it on the video, toggle A/B to compare, then Apply.");
+    let mut ab = CheckButton::new(16, 368, 170, 28, "A/B: processed");
+    ab.set_checked(true);
+    ab.set_tooltip("Ticked: hear the compressed track. Unticked: the original. Switch while playing.");
+    let mut aud = btn("▶ Audition", "Play from the playhead with the compressor applied", Some(C_PLAY));
+    aud.resize(196, 366, 130, 32);
+    let mut cancel = btn("Cancel", "", None);
+    cancel.resize(400, 366, 100, 32);
+    let mut apply = btn("Apply", "Apply to the track (undo with Ctrl+Z)", Some(C_ACCENT));
+    apply.resize(512, 366, 112, 32);
+    w.end();
+    w.make_modal(true);
+
+    {
+        let st = st.clone();
+        curve.draw(move |f| {
+            let p = st.borrow().params.sanitized();
+            let (x, y, wd, ht) = (f.x(), f.y(), f.w(), f.h());
+            draw::draw_rect_fill(x, y, wd, ht, rgb(C_FIELD));
+            let px = |db: f32| x + (((db + 60.0) / 66.0).clamp(0.0, 1.0) * (wd - 1) as f32) as i32;
+            let py = |db: f32| y + ht - 1 - (((db + 60.0) / 66.0).clamp(0.0, 1.0) * (ht - 1) as f32) as i32;
+            draw::set_draw_color(Color::from_rgb(52, 56, 64));
+            for g in [-48.0f32, -36.0, -24.0, -12.0, 0.0] { draw::draw_yxline(px(g), y, y + ht); draw::draw_xyline(x, py(g), x + wd); }
+            draw::set_draw_color(Color::from_rgb(80, 84, 94));
+            draw::draw_line(px(-60.0), py(-60.0), px(6.0), py(6.0));
+            // threshold marker
+            draw::set_draw_color(Color::from_rgb(110, 90, 60));
+            draw::draw_yxline(px(p.threshold_db), y, y + ht);
+            draw::set_draw_color(rgb(C_FX));
+            draw::set_line_style(draw::LineStyle::Solid, 2);
+            let mut last: Option<(i32, i32)> = None;
+            let mut d = -60.0f32;
+            while d <= 6.0 {
+                let o = d - p.static_gr(d) + p.makeup_db;
+                let pt = (px(d), py(o));
+                if let Some(l) = last { draw::draw_line(l.0, l.1, pt.0, pt.1); }
+                last = Some(pt);
+                d += 0.5;
+            }
+            draw::set_line_style(draw::LineStyle::Solid, 0);
+            draw::set_font(Font::Helvetica, 10);
+            draw::set_draw_color(rgb(C_CAPTION));
+            draw::draw_text("in dB →", x + wd - 46, y + ht - 4);
+            draw::draw_text("out", x + 4, y + 12);
+        });
+    }
+    // (Re)process if the params changed since the last run. O(n), ~1 s for 10 min of audio.
+    let process = {
+        let (st, orig) = (st.clone(), orig.clone());
+        move || -> (Arc<Vec<i16>>, FxStats) {
+            let p = st.borrow().params;
+            if let Some((dp, d, s)) = &st.borrow().done { if *dp == p { return (d.clone(), *s); } }
+            draw::set_cursor(Cursor::Wait); app::flush();
+            let (v, s) = opto_compress(&orig, ch, p);
+            draw::set_cursor(Cursor::Default);
+            let d = Arc::new(v);
+            st.borrow_mut().done = Some((p, d.clone(), s));
+            (d, s)
+        }
+    };
+    let show_stats = |stats: &mut Frame, s: FxStats| {
+        let db = |x: f32| 20.0 * x.max(1e-6).log10();
+        stats.set_label(&format!("Gain reduction: max {:.1} dB, average {:.1} dB   ·   peak in {:.1} dBFS → out {:.1} dBFS",
+            s.max_gr_db, s.avg_gr_db, db(s.in_peak), db(s.out_peak)));
+    };
+    // Push the current A/B choice into the playback mixer.
+    let route = {
+        let (a, st, ab) = (app.clone(), st.clone(), ab.clone());
+        move || {
+            let mut s = a.borrow_mut();
+            s.fx_preview = if ab.is_checked() { st.borrow().done.as_ref().map(|(_, d, _)| (ti, d.clone())) } else { None };
+            s.sync_mix();
+        }
+    };
+    // Debounced re-process while auditioning (slider drags fire many callbacks).
+    let on_change = {
+        let (a, st, curve, stats, process, route) = (app.clone(), st.clone(), curve.clone(), stats.clone(), process.clone(), route.clone());
+        std::rc::Rc::new(move || {
+            let mut c = curve.clone(); c.redraw();
+            let g = { let mut d = st.borrow_mut(); d.gen += 1; d.gen };
+            let (a, st, stats, process, route) = (a.clone(), st.clone(), stats.clone(), process.clone(), route.clone());
+            app::add_timeout3(0.3, move |_| {
+                if st.borrow().gen != g { return; }
+                let auditioning = a.borrow().fx_preview.is_some() || a.borrow().play.playing.load(Relaxed);
+                if auditioning {
+                    let (_, s) = process();
+                    let mut sf = stats.clone();
+                    let db = |x: f32| 20.0 * x.max(1e-6).log10();
+                    sf.set_label(&format!("Gain reduction: max {:.1} dB, average {:.1} dB   ·   peak in {:.1} dBFS → out {:.1} dBFS",
+                        s.max_gr_db, s.avg_gr_db, db(s.in_peak), db(s.out_peak)));
+                    route();
+                }
+            });
+        })
+    };
+    for (k, sl) in sliders.iter_mut().enumerate() {
+        let (st, oc, set) = (st.clone(), on_change.clone(), specs[k].5);
+        sl.set_callback(move |s| { set(&mut st.borrow_mut().params, s.value()); oc(); });
+    }
+    {
+        let (st, oc, sls) = (st.clone(), on_change.clone(), sliders.clone());
+        preset.set_callback(move |c| {
+            let Some((_, p)) = OPTO_PRESETS.get(c.value().max(0) as usize) else { return };
+            st.borrow_mut().params = *p;
+            for (k, mut sl) in sls.clone().into_iter().enumerate() { sl.set_value((specs[k].4)(p)); }
+            oc();
+        });
+    }
+    { let route = route.clone(); ab.set_callback(move |_| route()); }
+    {
+        let (a, u, process, route, mut stats) = (app.clone(), ui.clone(), process.clone(), route.clone(), stats.clone());
+        aud.set_callback(move |b| {
+            let playing = a.borrow().play.playing.load(Relaxed);
+            if playing { a.borrow_mut().set_playing(false); b.set_label("▶ Audition"); return; }
+            let (_, s) = process();
+            show_stats(&mut stats, s);
+            route();
+            a.borrow_mut().set_playing(true);
+            b.set_label("■ Stop");
+            refresh(&a, &u);
+        });
+    }
+    let close = {
+        let (a, u, w) = (app.clone(), ui.clone(), w.clone());
+        move || {
+            { let mut s = a.borrow_mut(); s.set_playing(false); s.fx_preview = None; s.sync_mix(); }
+            let mut w = w.clone(); w.hide();
+            refresh(&a, &u);
+        }
+    };
+    { let close = close.clone(); cancel.set_callback(move |_| close()); }
+    { let close = close.clone(); w.set_callback(move |_| close()); }
+    {
+        let (a, process, close, name) = (app.clone(), process.clone(), close.clone(), name.clone());
+        apply.set_callback(move |_| {
+            let (d, s) = process();
+            close();
+            let mut st2 = a.borrow_mut();
+            let v = Arc::try_unwrap(d).unwrap_or_else(|d| (*d).clone());
+            st2.set_track_samples(ti, v, false);
+            st2.status = format!("Opto compressor on '{name}': max gain reduction {:.1} dB, avg {:.1} dB (Ctrl+Z to undo)", s.max_gr_db, s.avg_gr_db);
+        });
+    }
+    w.show();
+    // keep the audition button label in sync when playback ends on its own
+    while w.shown() {
+        app::wait();
+        let playing = app.try_borrow().map(|s| s.play.playing.load(Relaxed)).unwrap_or(false);
+        if !playing && aud.label() != "▶ Audition" { aud.set_label("▶ Audition"); }
+    }
+    refresh(app, ui);
+}
+
+/// Loudness normalization dialog: shows each track's measured LUFS, target + scope.
+fn norm_dialog(app: &Shared, ui: &Ui) {
+    let measured: Vec<String> = {
+        let a = app.borrow();
+        if a.job.is_some() || a.narr.is_some() { return; }
+        let Some(p) = &a.proj else { return };
+        if p.edit.tracks.is_empty() { drop(a); alert("No audio tracks to normalize."); return; }
+        p.edit.tracks.iter().map(|t| match loudness_lufs(&t.data, t.ch as usize) {
+            Some(l) => format!("{}: {:.1} LUFS", t.name, l), None => format!("{}: silent", t.name) }).collect()
+    };
+    let has_sel = app.borrow().sel_track.is_some();
+    let mut w = Window::default().with_size(500, 300).with_label("Normalize levels");
+    let mut title = Frame::new(16, 10, 468, 26, "Normalize levels (loudness)").with_align(Align::Left | Align::Inside);
+    title.set_label_font(Font::HelveticaBold); title.set_label_size(15);
+    let mut info = Frame::new(16, 38, 468, 54, None).with_align(Align::Left | Align::Inside | Align::Wrap | Align::Top);
+    info.set_label("Measures each track's integrated loudness (ITU-R BS.1770, gated) and brings it to the target. A look-ahead limiter keeps peaks under -1 dBFS. One undo step.");
+    info.set_label_size(12); info.set_label_color(rgb(C_CAPTION));
+    Frame::new(16, 100, 80, 28, "Target").with_align(Align::Left | Align::Inside);
+    let mut target = Choice::new(100, 100, 384, 28, None);
+    let targets = [-14.0, -16.0, -19.0, -23.0];
+    target.add_choice("-14 LUFS · YouTube and streaming|-16 LUFS · voice and tutorials (recommended)|-19 LUFS · quieter, background|-23 LUFS · EBU R128 broadcast");
+    target.set_value(1);
+    Frame::new(16, 136, 80, 28, "Apply to").with_align(Align::Left | Align::Inside);
+    let mut scope = Choice::new(100, 136, 384, 28, None);
+    scope.add_choice("All tracks (same level)");
+    if has_sel { scope.add_choice("Selected track only"); }
+    scope.set_value(0);
+    for c in [&mut target, &mut scope] { c.set_color(rgb(C_PANEL)); }
+    let mut cur = Frame::new(16, 172, 468, 72, None).with_align(Align::Left | Align::Inside | Align::Wrap | Align::Top);
+    cur.set_label(&esc(&format!("Now:  {}", measured.join("   ·   "))));
+    cur.set_label_size(12);
+    let mut cancel = btn("Cancel", "", None); cancel.resize(262, 254, 100, 32);
+    let mut ok = btn("Normalize", "", Some(C_ACCENT)); ok.resize(372, 254, 112, 32);
+    w.end();
+    w.make_modal(true);
+    let go = std::rc::Rc::new(std::cell::Cell::new(false));
+    { let (mut w2, g) = (w.clone(), go.clone()); ok.set_callback(move |_| { g.set(true); w2.hide(); }); }
+    { let mut w2 = w.clone(); cancel.set_callback(move |_| w2.hide()); }
+    w.show();
+    while w.shown() { app::wait(); }
+    if !go.get() { return; }
+    let t = targets[target.value().clamp(0, 3) as usize];
+    let only = scope.value() == 1;
+    draw::set_cursor(Cursor::Wait); app::flush();
+    let r = { let mut a = app.borrow_mut(); a.set_playing(false); a.op_normalize(t, only) };
+    draw::set_cursor(Cursor::Default);
+    if let Err(e) = r { app.borrow_mut().status = e; }
+    refresh(app, ui);
+}
+
 /// Unsaved-changes guard for New/Open. Returns true when it is OK to drop the project.
 fn may_close_project(a: &Shared) -> bool {
     {
@@ -3012,6 +3533,20 @@ fn tick(app: &Shared, ui: &Ui) {
         } else if a.narr.is_some() { a.stop_narration(); need = true; }
         if !playing && ui.play.label().starts_with("||") { need = true; }
     }
+    // Output meter: instant attack, ~20 dB/s fall, 1.5 s peak hold (60 Hz tick)
+    {
+        let mut changed = false;
+        for c in 0..2 {
+            let pk = f32::from_bits(a.play.meter[c].swap(0, Relaxed)).min(4.0);
+            let nv = pk.max(a.vu[c] * 0.9624);
+            let nv = if nv < 1e-4 { 0.0 } else { nv };
+            if nv != a.vu[c] { a.vu[c] = nv; changed = true; }
+            let (h, t) = a.vu_hold[c];
+            if pk >= h { a.vu_hold[c] = (pk, Some(Instant::now())); changed |= pk != h; }
+            else if t.map(|t| t.elapsed() > Duration::from_millis(1500)).unwrap_or(false) { a.vu_hold[c] = (a.vu[c], Some(Instant::now())); changed = true; }
+        }
+        if changed { let mut m = ui.meter.clone(); m.redraw(); }
+    }
     request_preview(&mut a, ui);
     // Decoded preview frame
     let res = a.dec.res.lock().unwrap().take();
@@ -3028,136 +3563,260 @@ fn tick(app: &Shared, ui: &Ui) {
     if need { refresh(app, ui); }
 }
 
+// ---- UI theme ------------------------------------------------------------------------
+// One dark palette for the whole app (matches the timeline and video preview), with colour
+// reserved for meaning: red = record, green = play, blue = export/apply, amber = FX.
+const C_BG: (u8, u8, u8) = (34, 36, 41);
+const C_PANEL: (u8, u8, u8) = (44, 47, 54);
+const C_FIELD: (u8, u8, u8) = (24, 26, 30);
+const C_TEXT: (u8, u8, u8) = (226, 228, 232);
+const C_CAPTION: (u8, u8, u8) = (128, 136, 150);
+const C_REC: (u8, u8, u8) = (170, 48, 48);
+const C_PLAY: (u8, u8, u8) = (40, 128, 76);
+const C_ACCENT: (u8, u8, u8) = (44, 96, 168);
+const C_FX: (u8, u8, u8) = (150, 104, 30);
+
+fn rgb(c: (u8, u8, u8)) -> Color { Color::from_rgb(c.0, c.1, c.2) }
+
+fn apply_theme() {
+    app::background(C_BG.0, C_BG.1, C_BG.2);
+    app::background2(C_FIELD.0, C_FIELD.1, C_FIELD.2);
+    app::foreground(C_TEXT.0, C_TEXT.1, C_TEXT.2);
+    app::set_selection_color(70, 130, 220);
+    app::set_inactive_color(110, 114, 122);
+    fltk::misc::Tooltip::set_color(Color::from_rgb(250, 246, 220));
+    fltk::misc::Tooltip::set_text_color(Color::from_rgb(20, 20, 20));
+    fltk::misc::Tooltip::set_font_size(12);
+    fltk::misc::Tooltip::set_delay(0.5);
+}
+
+/// Button with fixed role colour and readable label.
+fn btn(label: &str, tip: &str, role: Option<(u8, u8, u8)>) -> Button {
+    let mut b = Button::default().with_label(label);
+    b.set_label_size(13);
+    if !tip.is_empty() { b.set_tooltip(tip); }
+    if let Some(c) = role {
+        b.set_color(rgb(c));
+        b.set_selection_color(rgb((c.0 / 2 + 20, c.1 / 2 + 20, c.2 / 2 + 20)));
+        b.set_label_color(Color::White);
+    } else {
+        b.set_color(rgb(C_PANEL));
+    }
+    b
+}
+
+/// Small uppercase group caption at the start of a dock row.
+fn caption(r: &mut Flex, text: &str, w: i32) {
+    let mut f = Frame::default().with_label(text).with_align(Align::Left | Align::Inside);
+    f.set_label_font(Font::HelveticaBold);
+    f.set_label_size(10);
+    f.set_label_color(rgb(C_CAPTION));
+    r.fixed(&f, w);
+}
+
+/// Thin vertical divider between groups in a row.
+fn divider(r: &mut Flex) {
+    let mut f = Frame::default();
+    f.draw(|f| {
+        draw::set_draw_color(Color::from_rgb(70, 74, 84));
+        draw::draw_yxline(f.x() + f.w() / 2, f.y() + 4, f.y() + f.h() - 4);
+    });
+    r.fixed(&f, 10);
+}
+
+/// One dock row: fixed-width widgets left-aligned; a trailing spacer absorbs extra width so
+/// nothing stretches into giant buttons on wide screens.
+fn row() -> Flex { let mut r = Flex::default().row(); r.set_pad(4); r }
+
+fn end_row(col: &mut Flex, r: Flex) { Frame::default(); r.end(); col.fixed(&r, 30); }
+
 fn build_ui(app: &Shared) -> Ui {
-    let mut win = Window::default().with_size(1180, 816).with_label(&format!("{APP_NAME} v{VERSION}"));
-    win.size_range(820, 560, 0, 0);
+    apply_theme();
+    let mut win = Window::default().with_size(1180, 860).with_label(&format!("{APP_NAME} v{VERSION}"));
+    win.size_range(1000, 620, 0, 0);
     let mut col = Flex::default_fill().column();
     col.set_margin(6);
-    col.set_pad(4);
+    col.set_pad(3);
 
-    let mut r1 = Flex::default().row();
-    r1.set_pad(4);
-    let rec_full = Button::default().with_label("● Record Screen");
-    let rec_region = Button::default().with_label("● Record Region");
+    // Video preview on top: it gets all spare height.
+    let mut preview = Frame::default();
+    preview.set_frame(FrameType::FlatBox);
+    preview.set_color(Color::Black);
+
+    const CAP: i32 = 70;
+    // Row 1: capture
+    let mut r = row();
+    caption(&mut r, "RECORD", CAP);
+    let rec_full = btn("● Record Screen", "Record the whole screen (all monitors)", Some(C_REC));
+    let rec_region = btn("● Record Region", "Drag a rectangle to record part of the screen", Some(C_REC));
     let mut fps = Choice::default();
     for f in FPS_CHOICES { fps.add_choice(&format!("{f} fps")); }
     fps.set_value(5);
+    fps.set_tooltip("Capture frame rate");
     let mut quality = Choice::default();
     quality.add_choice("Draft (q60)|Standard (q80)|Sharp text (q92 4:4:4)");
     quality.set_value(1);
-    let half = CheckButton::default().with_label("Half-res");
-    let cursor = CheckButton::default().with_label("Cursor");
+    quality.set_tooltip("JPEG quality of the recording (the only lossy step)");
+    let mut half = CheckButton::default().with_label("Half-res");
+    half.set_tooltip("Record at half width/height: 4x smaller files");
+    let mut cursor = CheckButton::default().with_label("Cursor");
     cursor.set_checked(true);
+    cursor.set_tooltip("Draw the mouse pointer into the video");
+    divider(&mut r);
     let mut mic = Choice::default();
     mic.add_choice("Mic: off");
     mic.add_choice("Mic: default");
     for n in &app.borrow().mics { mic.add_choice(&format!("Mic: {}", esc(&n.replace(['/', '|', '&', '_', '\\'], " ")))); }
     mic.set_value(1);
+    mic.set_tooltip("Microphone for recording and narration");
     let mut sys = CheckButton::default().with_label("System audio");
     sys.set_tooltip("Also record what the computer plays (videos, apps) to its own \"System\" track.\n\
 Linux: needs PulseAudio or PipeWire. Use headphones to keep speaker sound out of the mic.");
-    r1.fixed(&rec_full, 130); r1.fixed(&rec_region, 130); r1.fixed(&fps, 80); r1.fixed(&quality, 180); r1.fixed(&half, 80); r1.fixed(&cursor, 70); r1.fixed(&sys, 115);
-    r1.end();
-    col.fixed(&r1, 30);
+    r.fixed(&rec_full, 136); r.fixed(&rec_region, 136); r.fixed(&fps, 76); r.fixed(&quality, 178);
+    r.fixed(&half, 78); r.fixed(&cursor, 70); r.fixed(&mic, 200); r.fixed(&sys, 112);
+    end_row(&mut col, r);
 
-    let mut r2 = Flex::default().row();
-    r2.set_pad(4);
-    let mut new = Button::default().with_label("New");
-    new.set_tooltip("Close the current project and start fresh (Ctrl+N)");
-    let open = Button::default().with_label("Open…");
-    let save = Button::default().with_label("Save");
-    let exp_mkv = Button::default().with_label("Export MKV (instant)");
-    let exp_mov = Button::default().with_label("Export MOV (lossless, ffmpeg)");
-    let exp_mp4 = Button::default().with_label("Export MP4 (H.264, ffmpeg)");
-    let exp_wav = Button::default().with_label("Export WAV mix");
-    Frame::default();
-    r2.fixed(&new, 70); r2.fixed(&open, 90); r2.fixed(&save, 80); r2.fixed(&exp_mkv, 160); r2.fixed(&exp_mov, 210); r2.fixed(&exp_mp4, 200); r2.fixed(&exp_wav, 120);
-    r2.end();
-    col.fixed(&r2, 30);
+    // Row 2: project + export
+    let mut r = row();
+    caption(&mut r, "PROJECT", CAP);
+    let new = btn("New", "Close this project and start fresh  (Ctrl+N)", None);
+    let open = btn("Open…", "Open a project folder (project.txt)", None);
+    let save = btn("Save", "Save the project  (Ctrl+S)", None);
+    divider(&mut r);
+    caption(&mut r, "EXPORT", 54);
+    let exp_mkv = btn("MKV · instant", "Matroska, no re-encode: exports at disk speed, zero quality loss", Some(C_ACCENT));
+    let exp_mov = btn("MOV · lossless", "QuickTime via ffmpeg -c copy (no re-encode). Needs ffmpeg.", Some(C_ACCENT));
+    let exp_mp4 = btn("MP4 · H.264", "H.264 + AAC for upload sites (re-encodes). Needs ffmpeg.", Some(C_ACCENT));
+    let exp_wav = btn("WAV · audio mix", "The stereo mix of all unmuted tracks", Some(C_ACCENT));
+    r.fixed(&new, 70); r.fixed(&open, 80); r.fixed(&save, 70);
+    r.fixed(&exp_mkv, 120); r.fixed(&exp_mov, 124); r.fixed(&exp_mp4, 116); r.fixed(&exp_wav, 130);
+    end_row(&mut col, r);
 
-    let mut preview = Frame::default();
-    preview.set_frame(FrameType::FlatBox);
-    preview.set_color(Color::Black);
-
-    let mut r3 = Flex::default().row();
-    r3.set_pad(4);
-    let play = Button::default().with_label("▶ Play");
+    // Row 3: transport + edit
+    let mut r = row();
+    caption(&mut r, "PLAY · EDIT", CAP);
+    let play = btn("▶ Play", "Play / pause  (Space). Double-tap Space: back to start", Some(C_PLAY));
     let mut time = Frame::default().with_label("00:00.00 / 00:00.00");
+    time.set_frame(FrameType::FlatBox);
+    time.set_color(rgb(C_FIELD));
     time.set_label_font(Font::Courier);
-    let cut = Button::default().with_label("Cut");
-    let ifreeze = Button::default().with_label("Insert freeze");
+    time.set_label_size(14);
+    let mut meter = Frame::default();
+    meter.set_tooltip("Output level (peak, dBFS). Aim for speech peaks in the yellow zone.");
+    divider(&mut r);
+    let cut = btn("Cut", "Delete the selection (ripple)  (Del, Ctrl+X)", None);
+    let ifreeze = btn("Insert freeze", "Insert a still of the current frame; tracks get silence  (F)", None);
     let mut fsecs = Spinner::default();
     fsecs.set_range(0.1, 600.0); fsecs.set_step(0.5); fsecs.set_value(2.0);
-    let freeze_sel = Button::default().with_label("Freeze selection");
-    let undo = Button::default().with_label("Undo");
-    let redo = Button::default().with_label("Redo");
-    let narr = Button::default().with_label("● Re-record narration");
-    let fitz = Button::default().with_label("⇔ Fit");
-    r3.fixed(&play, 80); r3.fixed(&time, 170); r3.fixed(&cut, 70); r3.fixed(&ifreeze, 120); r3.fixed(&fsecs, 64);
-    r3.fixed(&freeze_sel, 140); r3.fixed(&undo, 70); r3.fixed(&redo, 70); r3.fixed(&narr, 180);
-    r3.end();
-    col.fixed(&r3, 30);
+    fsecs.set_tooltip("Insert-freeze length in seconds");
+    let freeze_sel = btn("Freeze sel.", "Hold the first frame across the selection; audio keeps playing", None);
+    divider(&mut r);
+    let undo = btn("Undo", "Undo  (Ctrl+Z)", None);
+    let redo = btn("Redo", "Redo  (Ctrl+Y)", None);
+    divider(&mut r);
+    let narr = btn("● Narrate", "Re-record narration over the selection (or from the playhead)", Some(C_REC));
+    let fitz = btn("⇔ Fit", "Zoom the timeline to show everything", None);
+    r.fixed(&play, 84); r.fixed(&time, 156); r.fixed(&meter, 132); r.fixed(&cut, 50); r.fixed(&ifreeze, 104);
+    r.fixed(&fsecs, 54); r.fixed(&freeze_sel, 92); r.fixed(&undo, 56); r.fixed(&redo, 56); r.fixed(&narr, 96); r.fixed(&fitz, 60);
+    end_row(&mut col, r);
 
-    let mut r4 = Flex::default().row();
-    r4.set_pad(4);
-    let track = Choice::default().with_label("Track");
-    let mute = Button::default().with_label("Mute");
+    // Row 4: track
+    let mut r = row();
+    caption(&mut r, "TRACK", CAP);
+    let mut track = Choice::default();
+    track.set_tooltip("Selected audio track (or click its lane on the timeline)");
+    let mute = btn("Mute", "Mute / unmute the selected track", None);
     let mut gain = HorNiceSlider::default();
     gain.set_range(0.0, 2.0); gain.set_step(0.01, 1); gain.set_value(1.0); gain.set_tooltip("Track gain (0–200%)");
-    let shl = Button::default().with_label("◀ 1f");
-    let shr = Button::default().with_label("1f ▶");
-    let newt = Button::default().with_label("+ Empty track");
-    let import = Button::default().with_label("+ Add audio file…");
-    let replace = Button::default().with_label("Swap audio…");
-    let remove = Button::default().with_label("× Remove track");
-    let mut sp = Frame::default(); sp.set_label("");
-    r4.fixed(&track, 200); r4.fixed(&mute, 70); r4.fixed(&gain, 140); r4.fixed(&shl, 50); r4.fixed(&shr, 50);
-    r4.fixed(&newt, 120); r4.fixed(&import, 150); r4.fixed(&replace, 120); r4.fixed(&remove, 130);
-    r4.end();
-    col.fixed(&r4, 30);
+    gain.set_color(rgb(C_FIELD));
+    let shl = btn("◀ 1f", "Nudge the track one frame earlier", None);
+    let shr = btn("1f ▶", "Nudge the track one frame later", None);
+    divider(&mut r);
+    let newt = btn("+ Track", "Add an empty narration track", None);
+    let import = btn("+ Audio file…", "Add an audio file (or a video's audio) at the playhead", None);
+    let replace = btn("Swap…", "Replace the selected track's audio with a file", None);
+    let remove = btn("× Remove", "Delete the selected track", None);
+    divider(&mut r);
+    let comp = btn("Opto compressor…", "Warm CL 1B-style optical compressor for the selected track (mic)", Some(C_FX));
+    r.fixed(&track, 170); r.fixed(&mute, 56); r.fixed(&gain, 100); r.fixed(&shl, 44); r.fixed(&shr, 44);
+    r.fixed(&newt, 76); r.fixed(&import, 110); r.fixed(&replace, 66); r.fixed(&remove, 84); r.fixed(&comp, 140);
+    end_row(&mut col, r);
 
-    // r5: speed-up + dead-air tools
-    let mut r5 = Flex::default().row();
-    r5.set_pad(4);
-    let speed_lbl = Frame::default().with_label("Speed:").with_align(Align::Right | Align::Inside);
+    // Row 5: whole-project tools
+    let mut r = row();
+    caption(&mut r, "TOOLS", CAP);
+    let norm = btn("Normalize levels…", "Bring every track to the same loudness (LUFS) with a -1 dBFS peak ceiling", Some(C_FX));
+    divider(&mut r);
+    let speed_lbl = Frame::default().with_label("Speed").with_align(Align::Right | Align::Inside);
     let mut speed = Choice::default();
     for sp in SPEEDS { speed.add_choice(&format!("{}×", fmt_speed(sp))); }
     speed.set_value(2);
-    let mut speed_mute = CheckButton::default().with_label("Mute sped-up audio");
+    let mut speed_mute = CheckButton::default().with_label("Mute audio");
     speed_mute.set_tooltip("Off: audio is time-compressed with pitch preserved (speech stays natural).\nOn: the sped-up range is silent.");
-    let mut speed_btn = Button::default().with_label("» Speed up selection");
-    speed_btn.set_tooltip("Play the selected range faster (ripple). Video frames are skipped losslessly;\naudio is compressed to match. Undo with Ctrl+Z.");
-    let mut find_dead = Button::default().with_label("Find dead air…");
-    find_dead.set_tooltip("Find stretches where every audible track is silent AND the picture does not change.\nCursor movement alone does not count as a change.");
-    let mut rm_dead = Button::default().with_label("Remove dead air");
-    rm_dead.set_tooltip("Cut all highlighted dead-air regions in one undoable step");
-    let mut compact = Button::default().with_label("Compact project…");
-    compact.set_tooltip("Rewrite the recording so it holds only frames the edit uses (frees disk space; clears undo)");
-    Frame::default();
-    r5.fixed(&speed_lbl, 50); r5.fixed(&speed, 70); r5.fixed(&speed_mute, 160); r5.fixed(&speed_btn, 170);
-    r5.fixed(&find_dead, 130); r5.fixed(&rm_dead, 170); r5.fixed(&compact, 150);
-    r5.end();
-    col.fixed(&r5, 30);
+    let speed_btn = btn("» Speed up sel.", "Play the selected range faster (ripple, lossless video). Undo with Ctrl+Z.", None);
+    divider(&mut r);
+    let find_dead = btn("Find dead air…", "Find stretches where all audio is silent AND the picture does not change", None);
+    let rm_dead = btn("Remove dead air", "Cut all highlighted dead-air regions in one undoable step", None);
+    let compact = btn("Compact…", "Rewrite the recording to hold only frames the edit uses (frees disk; clears undo)", None);
+    r.fixed(&norm, 140); r.fixed(&speed_lbl, 40); r.fixed(&speed, 62); r.fixed(&speed_mute, 96); r.fixed(&speed_btn, 118);
+    r.fixed(&find_dead, 116); r.fixed(&rm_dead, 150); r.fixed(&compact, 90);
+    end_row(&mut col, r);
 
     let mut timeline = Frame::default();
     timeline.set_frame(FrameType::FlatBox);
     col.fixed(&timeline, 210);
     let mut status = Frame::default().with_align(Align::Left | Align::Inside);
+    status.set_frame(FrameType::FlatBox);
+    status.set_color(rgb(C_FIELD));
     status.set_label_size(12);
-    col.fixed(&status, 22);
+    col.fixed(&status, 24);
     col.end();
     win.end();
     win.make_resizable(true);
+    for mut c in [fps.clone(), quality.clone(), mic.clone(), track.clone(), speed.clone()] { c.set_color(rgb(C_PANEL)); c.set_label_size(13); c.set_text_size(13); }
     let ui = Ui { win, rec_full, rec_region, fps, quality, half, cursor, mic, sys, open, save, exp_mkv, exp_mov, exp_mp4, exp_wav,
         preview, play, time, cut, ifreeze, fsecs, freeze_sel, undo, redo, narr, fitz, track, mute, gain, shl, shr, newt, import,
-        replace, remove, timeline, status, new, speed, speed_mute, speed_btn, find_dead, rm_dead, compact };
+        replace, remove, timeline, status, new, speed, speed_mute, speed_btn, find_dead, rm_dead, compact, comp, norm, meter };
     // Buttons should not steal Space/Enter (used as shortcuts).
     for mut b in [ui.rec_full.clone(), ui.rec_region.clone(), ui.open.clone(), ui.save.clone(), ui.exp_mkv.clone(), ui.exp_mov.clone(),
         ui.exp_mp4.clone(), ui.exp_wav.clone(), ui.play.clone(), ui.cut.clone(), ui.ifreeze.clone(), ui.freeze_sel.clone(), ui.undo.clone(),
         ui.redo.clone(), ui.narr.clone(), ui.fitz.clone(), ui.mute.clone(), ui.shl.clone(), ui.shr.clone(), ui.newt.clone(),
         ui.import.clone(), ui.replace.clone(), ui.remove.clone(), ui.new.clone(), ui.speed_btn.clone(), ui.find_dead.clone(),
-        ui.rm_dead.clone(), ui.compact.clone()] { b.clear_visible_focus(); }
+        ui.rm_dead.clone(), ui.compact.clone(), ui.comp.clone(), ui.norm.clone()] { b.clear_visible_focus(); }
     ui
+}
+
+/// Draw the stereo output meter: -48..+0 dBFS, green < -18, yellow < -6, red above,
+/// with a 1.5 s peak-hold tick per channel.
+fn draw_meter(f: &Frame, vu: [f32; 2], hold: [f32; 2]) {
+    let (x, y, w, h) = (f.x(), f.y(), f.w(), f.h());
+    draw::draw_rect_fill(x, y, w, h, rgb(C_FIELD));
+    let pos = |lin: f32| -> i32 {
+        let db = 20.0 * lin.max(1e-6).log10();
+        (((db + 48.0) / 48.0).clamp(0.0, 1.0) * (w - 4) as f32) as i32
+    };
+    let (z1, z2) = (pos(10f32.powf(-18.0 / 20.0)), pos(10f32.powf(-6.0 / 20.0)));
+    let bh = (h - 8) / 2;
+    for c in 0..2 {
+        let by = y + 3 + c as i32 * (bh + 2);
+        draw::draw_rect_fill(x + 2, by, w - 4, bh, Color::from_rgb(40, 43, 50));
+        let p = pos(vu[c]);
+        let seg = |a: i32, b: i32, col: Color| { if b > a { draw::draw_rect_fill(x + 2 + a, by, b - a, bh, col); } };
+        seg(0, p.min(z1), Color::from_rgb(60, 190, 100));
+        seg(z1, p.min(z2), Color::from_rgb(220, 200, 60));
+        seg(z2, p, Color::from_rgb(230, 70, 60));
+        if hold[c] > 1e-4 {
+            let hx = x + 2 + pos(hold[c]).min(w - 5);
+            draw::set_draw_color(if hold[c] >= 0.891 { Color::from_rgb(255, 90, 80) } else { Color::White });
+            draw::draw_yxline(hx, by, by + bh - 1);
+        }
+    }
+    // scale ticks at -36, -24, -18, -12, -6, 0
+    draw::set_draw_color(Color::from_rgb(90, 95, 105));
+    for db in [-36.0f32, -24.0, -18.0, -12.0, -6.0, 0.0] {
+        let tx = x + 2 + pos(10f32.powf(db / 20.0)).min(w - 5);
+        draw::draw_yxline(tx, y + h - 3, y + h - 1);
+    }
 }
 
 /// Global editing shortcuts (called from the focused timeline and the main window).
@@ -3237,7 +3896,7 @@ fn wire(app: &Shared, ui: &Ui) {
             } else if s.proj.is_none() {
                 draw::set_draw_color(Color::from_rgb(150, 150, 150));
                 draw::set_font(Font::Helvetica, 16);
-                draw::draw_text2(&format!("{APP_NAME} v{VERSION}\n\n● Record Screen / ● Record Region to begin\n\nSpace play/pause · Space Space back to 0 · Del/Ctrl+X cut · F insert freeze\nCtrl+Z/Y undo/redo · Ctrl+S save · Ctrl+N new"),
+                draw::draw_text2(&format!("{APP_NAME} v{VERSION}\n\n● Record Screen / ● Record Region to begin\n\nSpace play/pause · Space Space back to 0 · Del/Ctrl+X cut · F insert freeze\nCtrl+Z/Y undo/redo · Ctrl+S save · Ctrl+N new\n\nAfter recording: TRACK › Opto compressor for the mic, TOOLS › Normalize levels"),
                     f.x(), f.y(), f.w(), f.h(), Align::Center);
             }
         });
@@ -3376,6 +4035,13 @@ fn wire(app: &Shared, ui: &Ui) {
     cb!(ui.find_dead, |a, u| { start_dead_scan(a, u); });
     cb!(ui.rm_dead, |a, u| { let r = a.borrow_mut().op_remove_dead(); report(a, r); });
     cb!(ui.compact, |a, u| { start_compact(a, u); });
+    cb!(ui.comp, |a, u| { comp_dialog(a, u); });
+    cb!(ui.norm, |a, u| { norm_dialog(a, u); });
+    {
+        let a = app.clone();
+        let mut m = ui.meter.clone();
+        m.draw(move |f| { if let Ok(s) = a.try_borrow() { draw_meter(f, s.vu, [s.vu_hold[0].0, s.vu_hold[1].0]); } });
+    }
     cb!(ui.fitz, |a, u| { let mut s = a.borrow_mut(); s.scroll = 0.0; s.zoom = (u.timeline.w() as f64 / s.total().max(1) as f64).max(1e-4); });
     cb!(ui.narr, |a, u| {
         let mic = { let s = a.borrow(); match u.mic.value() { i if i >= 2 => s.mics.get(i as usize - 2).cloned(), _ => None } };
@@ -3522,6 +4188,48 @@ fn selftest(out: &Path, secs: f64, full: bool, sys: bool) -> Res<()> {
         assert_eq!(z.len(), AR as usize * 60);
         println!("time_stretch 60 s stereo -> 30 s in {:.3}s", t.elapsed().as_secs_f64());
     }
+    // --- v1.3.0: loudness meter accuracy, normalization ceiling, opto compressor gain reduction
+    {
+        let sine = |amp: f32, secs: usize, ch: usize| -> Vec<i16> {
+            (0..AR as usize * secs).flat_map(|i| { let v = ((i as f32 * 997.0 * std::f32::consts::TAU / AR as f32).sin() * amp * 32767.0) as i16; std::iter::repeat_n(v, ch) }).collect()
+        };
+        // BS.1770: a full-scale-relative stereo 997 Hz sine at A dBFS peak reads ~A LUFS
+        let st = sine(0.1, 4, 2);
+        let l = loudness_lufs(&st, 2).ok_or("stereo tone measured silent")?;
+        let lm = loudness_lufs(&sine(0.1, 4, 1), 1).ok_or("mono tone measured silent")?;
+        println!("loudness: stereo -20 dBFS tone {l:.2} LUFS, mono (dual-mono) {lm:.2} LUFS");
+        assert!((l + 20.0).abs() < 0.8 && (lm - l).abs() < 0.05, "BS.1770 loudness off");
+        assert!(loudness_lufs(&vec![0i16; AR as usize * 2], 1).is_none(), "silence must be gated out");
+        // normalize a quiet mono track up to -16 LUFS: level hits target, peaks stay <= -1 dBFS
+        let quiet = sine(0.02, 4, 1);
+        let lq = loudness_lufs(&quiet, 1).unwrap();
+        let (v, lim) = gain_with_limiter(&quiet, 1, 10f32.powf((-16.0 - lq) as f32 / 20.0), 10f32.powf(-1.0 / 20.0));
+        let ln = loudness_lufs(&v, 1).unwrap();
+        let pk = v.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0) as f32 / 32768.0;
+        println!("normalize: {lq:.1} -> {ln:.2} LUFS, peak {:.2} dBFS, limiter {lim:.2} dB", 20.0 * pk.log10());
+        assert!((ln + 16.0).abs() < 0.6, "normalized loudness off target");
+        assert!(pk <= 10f32.powf(-1.0 / 20.0) + 1e-4, "peak ceiling exceeded");
+        // a hot track must be limited, never clipped
+        let (h, lim2) = gain_with_limiter(&sine(0.9, 2, 1), 1, 4.0, 10f32.powf(-1.0 / 20.0));
+        let pk2 = h.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0) as f32 / 32768.0;
+        assert!(pk2 <= 0.8913 + 1e-3 && lim2 > 10.0, "limiter failed: peak {pk2} lim {lim2}");
+        // opto compressor: -6 dBFS tone, thr -20, 4:1, no makeup/warmth -> ~10.5 dB reduction
+        let pr = OptoParams { threshold_db: -20.0, ratio: 4.0, attack_ms: 5.0, release_s: 0.3, warmth: 0.0, makeup_db: 0.0 };
+        let hot = sine(0.5, 3, 1);
+        let t3 = Instant::now();
+        let (c, cs) = opto_compress(&hot, 1, pr);
+        assert_eq!(c.len(), hot.len());
+        let tail = &c[c.len() - AR as usize / 2..];
+        let pko = tail.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0) as f32 / 32768.0;
+        println!("opto: max GR {:.1} dB, steady out peak {:.2} dBFS (want ~-16.5) in {:.3}s", cs.max_gr_db, 20.0 * pko.log10(), t3.elapsed().as_secs_f64());
+        assert!((20.0 * pko.log10() + 16.5).abs() < 1.0, "compressor steady-state gain wrong");
+        // warmth: unity small-signal gain, adds harmonics, no DC
+        let (wv, _) = opto_compress(&sine(0.01, 2, 1), 1, OptoParams { warmth: 1.0, threshold_db: 0.0, ..pr });
+        let rms = |v: &[i16]| (v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+        let ratio = rms(&wv[AR as usize..]) / rms(&sine(0.01, 2, 1)[AR as usize..]);
+        let dc = wv[AR as usize..].iter().map(|&x| x as f64).sum::<f64>() / AR as f64;
+        assert!((ratio - 1.0).abs() < 0.05 && dc.abs() < 5.0, "tube stage not unity/DC-free: {ratio} {dc}");
+    }
     // --- v1.2.0: speed-up of a range (ripple), Fast seg mapping + save/load round trip
     let before_speed = e.total();
     let a0 = 3u32;
@@ -3626,6 +4334,7 @@ fn main() {
         proj: None, play, out, clock: None, playhead: 0, sel: None, sel_track: None, zoom: 1.0, scroll: 0.0, drag_anchor: None,
         peaks: HashMap::new(), rec: None, rec_pending: false, ctl: None, narr: None, dec: Decoder::new(), preview: None, job: None,
         edit_gen: 0, dead: Vec::new(), dead_gen: u64::MAX, space_at: None,
+        fx_preview: None, vu: [0.0; 2], vu_hold: [(0.0, None); 2],
         mics: input_device_names(),
         status: match out_err { Some(e) => format!("Ready (no audio output: {e}; preview is silent)"), None => "Ready".into() },
         ffmpeg: find_ffmpeg(),

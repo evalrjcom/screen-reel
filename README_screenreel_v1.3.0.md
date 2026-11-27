@@ -1,12 +1,12 @@
-# ScreenReel v1.2.0 — User & Developer Guide
+# ScreenReel v1.3.0 — User & Developer Guide
 
 ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written in Rust and FLTK. It builds as a single binary for Linux and Windows.
 
 | | |
 |---|---|
-| Source | `screenreel_v1.2.0.rs` (single file, about 3,600 lines) |
-| Build helper | `build_screenreel_v1.2.0.sh` |
-| CI | `.github/workflows/screenreel_v1.2.0.yml` |
+| Source | `screenreel_v1.3.0.rs` (single file, about 4,400 lines) |
+| Build helper | `build_screenreel_v1.3.0.sh` |
+| CI | `.github/workflows/screenreel_v1.3.0.yml` |
 | Binary size | about 4.1–4.7 MB (Linux, stripped, LTO) |
 
 ---
@@ -22,6 +22,9 @@ ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written 
 | Cut | Ripple-deletes the selection from the video and from every audio track. |
 | Insert freeze | Holds the frame under the playhead for N seconds. Tracks get matching silence, which you can narrate over. |
 | Freeze selection | Holds the first frame of the selection across the whole range. Audio keeps playing. |
+| Opto compressor | Warm, CL 1B-style optical compressor for the mic (or any track). It has presets, a live transfer curve and A/B audition on the video before you apply. |
+| Normalize levels | Brings every track to the same loudness (ITU-R BS.1770 LUFS, e.g. −16 LUFS for voice). A look-ahead limiter keeps peaks under −1 dBFS. |
+| Level meter | Stereo output peak meter with peak hold, next to the time display. |
 | Speed up selection | Plays the selected range 1.25× to 16× faster. Video skips frames losslessly. Audio is time-compressed with its pitch kept (WSOLA), or muted if you prefer. |
 | Find / remove dead air | Finds stretches where every audible track is silent **and** the picture doesn't change, highlights them, and cuts them all in one undoable step. |
 | Compact project | Rewrites the recording so it keeps only the frames your edit uses. Cut footage and dead air stop taking disk space. |
@@ -45,12 +48,12 @@ Audio is 48 kHz 16-bit PCM throughout. Mixing tracks for export is plain sample 
 
 ## 2. Quick start
 
-1. Run the binary (`screenreel_v1.2.0-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.2.0-windows-x86_64.exe`).
-2. Pick an fps, a quality and a microphone in the top bar. Tick **System audio** to also record what the computer plays.
+1. Run the binary (`screenreel_v1.3.0-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.3.0-windows-x86_64.exe`).
+2. Pick an fps, a quality and a microphone in the **RECORD** row under the preview. Tick **System audio** to also record what the computer plays.
 3. Click **● Record Screen**, or **● Record Region** and drag a rectangle (Esc or right-click cancels).
 4. After a 3-2-1 countdown, a small **REC** bar shows elapsed time with **|| Pause** and **■ Stop**.
 5. Click **■ Stop**. The recording opens in the editor and is already saved as a project in `~/Videos/ScreenReel/rec_YYYYMMDD_HHMMSS/` (`%USERPROFILE%\Videos\ScreenReel\…` on Windows; the timestamp is in UTC).
-6. Edit, then click **Export MKV (instant)**.
+6. Edit, then click **MKV · instant** (EXPORT, in the PROJECT row). For speech, run **Opto compressor…** on the mic track and **Normalize levels…** before exporting.
 
 ### Capture settings
 
@@ -87,6 +90,20 @@ If the encoders can't keep up, a frame is duplicated rather than letting audio d
 
 ## 3. Editing
 
+### The control dock
+
+All controls sit in one dock under the video preview. The preview takes the rest of the window. There are five labelled rows, ordered by when you use them:
+
+| Row | Contains |
+|---|---|
+| **RECORD** | ● Record Screen, ● Record Region, fps, quality, Half-res, Cursor, mic, System audio |
+| **PROJECT · EXPORT** | New, Open…, Save, then MKV · instant, MOV · lossless, MP4 · H.264, WAV · audio mix |
+| **PLAY · EDIT** | ▶ Play, time, level meter, Cut, Insert freeze (+ seconds), Freeze sel., Undo, Redo, ● Narrate, ⇔ Fit |
+| **TRACK** | track picker, Mute, gain, ±1 frame nudge, + Track, + Audio file…, Swap…, × Remove, **Opto compressor…** |
+| **TOOLS** | **Normalize levels…**, Speed (picker, Mute audio, » Speed up sel.), Find dead air…, Remove dead air, Compact… |
+
+Colour carries meaning: red records, green plays, blue exports or applies, amber is audio FX. Every control has a fixed width with a spacer at the end of its row, so nothing stretches into giant buttons on wide monitors. Every button has a tooltip showing its shortcut. Unavailable actions are dimmed rather than hidden, so the layout never jumps. The whole app uses one dark theme that matches the timeline and video.
+
 ### Timeline mouse controls
 
 | Action | Effect |
@@ -117,19 +134,68 @@ These work when the timeline or window has focus.
 
 ### Narration (ScreenPal-style re-record)
 
-1. Select the track to record into. If no track is selected, a new mono **Narration N** track is created. **+ Empty track** also makes one.
+1. Select the track to record into. If no track is selected, a new mono **Narration N** track is created. **+ Track** also makes one.
 2. Optionally drag-select a range.
-3. Click **● Re-record narration**. The video plays from the start of the range while the mic records. The track being replaced is muted during the take.
+3. Click **● Narrate**. The video plays from the start of the range while the mic records. The track being replaced is muted during the take.
 4. The take stops at the end of the range, or when you click again or press Space. With a selection, any part of the range you didn't record over becomes silence, so no old take is left behind.
 
 To sync narration, **◀ 1f / 1f ▶** shifts the selected track by one video frame.
 
+### Opto compressor (warm CL 1B style)
+
+Select the mic track (it's picked automatically if nothing is selected), then click **Opto compressor…**.
+
+| Control | Range | What it does |
+|---|---|---|
+| Preset | 5 | Voice: gentle 2:1 (default) · Voice: leveling 4:1 · Broadcast 6:1 · Warm glue 1.5:1 · Peak tamer 10:1 |
+| Threshold | −60…0 dB | Where compression starts. The 8 dB soft knee is typical of optical cells. |
+| Ratio | 1…20 | Compression above the threshold |
+| Attack | 0.5…200 ms | How fast the cell reacts |
+| Release | 0.05…5 s | Base release time. The release is **program-dependent**: after short peaks it recovers quickly, and after long or deep compression it recovers slowly, like the T4 photocell's "memory". That's why opto compression sounds smooth and doesn't pump. |
+| Warmth | 0…100 % | Tube make-up stage: asymmetric saturation that adds mostly 2nd-harmonic colour. Small signals pass at unity gain, and a DC blocker follows. |
+| Make-up | −12…+24 dB | Output gain |
+
+The curve on the right is the static transfer curve (input dB → output dB), and it updates as you move the controls.
+
+- **▶ Audition** plays the video from the playhead with the processed track in the real mixer.
+- **A/B: processed** switches between the processed and original sound while playing.
+- Changes made while auditioning are re-rendered automatically after about 0.3 s.
+- **Apply** writes the result to the track as one undo step. **Cancel** leaves the track untouched.
+- After a run, the dialog shows the maximum and average gain reduction and the input and output peaks.
+
+### Normalize levels
+
+**Normalize levels…** shows every track's current loudness. Pick a target:
+
+| Target | Use |
+|---|---|
+| −14 LUFS | YouTube and streaming |
+| **−16 LUFS** | voice and tutorials (recommended) |
+| −19 LUFS | quieter, background |
+| −23 LUFS | EBU R128 broadcast |
+
+Apply it to **all tracks** (they end up at the same level) or the selected track only.
+
+- **Measurement:** integrated loudness per ITU-R BS.1770-4: K-weighting, 400 ms blocks with 75 % overlap, −70 LUFS absolute and −10 LU relative gates.
+- **Mono tracks** are measured as the dual-mono signal they become in the stereo mix, so a mono mic and a stereo System track really do match.
+- **Peaks:** a 2 ms look-ahead / 80 ms release limiter keeps every sample at or under −1 dBFS. The status line reports any limiting.
+- **Boost cap:** gain is capped at +30 dB, so a nearly silent track isn't blown up into noise. Silent tracks are skipped.
+- **Undo:** all tracks change in one undo step, and the track gain sliders reset to 100 %.
+
+**Recommended order:** compress the mic first, then normalize everything.
+
+### Level meter and mix ceiling
+
+The meter next to the time shows the stereo output peak. It covers −48 to 0 dBFS: green below −18, yellow up to −6, then red. Its tick marks peak hold for 1.5 s.
+
+Playback and every export pass the mix through a soft ceiling. It's transparent below −1 dBFS, then a smooth tanh knee, so overlapping tracks never hard-clip.
+
 ### Speeding up a range
 
 1. Drag-select the range on the timeline.
-2. Pick a speed in **Speed:** (1.25×, 1.5×, 2×, 3×, 4×, 8×, 16×).
-3. Optionally tick **Mute sped-up audio**. Otherwise the audio is compressed to the new length with its pitch kept, so speech still sounds like speech, just faster.
-4. Click **» Speed up selection**. The range turns green with its speed label, and the selection now covers the shorter range.
+2. Pick a speed next to **Speed** (1.25×, 1.5×, 2×, 3×, 4×, 8×, 16×).
+3. Optionally tick **Mute audio**. Otherwise the audio is compressed to the new length with its pitch kept, so speech still sounds like speech, just faster.
+4. Click **» Speed up sel.** The range turns green with its speed label, and the selection now covers the shorter range.
 
 Speeding up an already sped-up range multiplies the speeds, up to 64×. Freeze segments inside the range simply get shorter. Undo with Ctrl+Z.
 
@@ -149,7 +215,7 @@ About 0.2 s is left at each edge of every region, so cuts never feel abrupt. Any
 
 ### Freeing disk space: Compact project
 
-Cutting, removing dead air and speeding up only change the edit list. The original recording stays on disk, which is what makes undo instant. When you're done, **Compact project…** reclaims the space:
+Cutting, removing dead air and speeding up only change the edit list. The original recording stays on disk, which is what makes undo instant. When you're done, **Compact…** reclaims the space:
 
 - It writes `frames_cN.mjpg` / `.idx` holding each frame the edit uses exactly once. Holds and speed-ups become repeated or skipped 12-byte index entries.
 - It points `project.txt` at the new files and deletes the old ones.
@@ -160,10 +226,10 @@ It is lossless: the JPEG bytes are copied. The edit is flattened to one blue seg
 
 | Button | What it does |
 |---|---|
-| **+ Add audio file…** | Adds a new track starting at the playhead. |
-| **Swap audio…** | Replaces the selected track's audio, starting at 0:00. Use it to drop in a cleaned-up voice-over or music bed. |
+| **+ Audio file…** | Adds a new track starting at the playhead. |
+| **Swap…** | Replaces the selected track's audio, starting at 0:00. Use it to drop in a cleaned-up voice-over or music bed. |
 | **Mute** and the gain slider | Change how the track is mixed for playback and export. Neither touches the stored samples. |
-| **× Remove track** | Deletes the track. Undo restores it. |
+| **× Remove** | Deletes the track. Undo restores it. |
 
 ---
 
@@ -171,10 +237,10 @@ It is lossless: the JPEG bytes are copied. The edit is flattened to one blue seg
 
 | Button | Output | Re-encode? | Needs |
 |---|---|---|---|
-| Export MKV (instant) | Matroska with `V_MJPEG` + `A_PCM/INT/LIT` 48 kHz stereo, 1-second clusters and cues (seekable) | **None** | nothing |
-| Export MOV (lossless) | QuickTime container, same streams, via `ffmpeg -c copy` | **None** | ffmpeg |
-| Export MP4 (H.264) | H.264 CRF 18 + AAC 192k, faststart, for upload sites | Yes (labelled) | ffmpeg |
-| Export WAV mix | 48 kHz stereo 16-bit mix of all unmuted tracks | n/a | nothing |
+| MKV · instant | Matroska with `V_MJPEG` + `A_PCM/INT/LIT` 48 kHz stereo, 1-second clusters and cues (seekable) | **None** | nothing |
+| MOV · lossless | QuickTime container, same streams, via `ffmpeg -c copy` | **None** | ffmpeg |
+| MP4 · H.264 | H.264 CRF 18 + AAC 192k, faststart, for upload sites | Yes (labelled) | ffmpeg |
+| WAV · audio mix | 48 kHz stereo 16-bit mix of all unmuted tracks | n/a | nothing |
 
 ### Getting ffmpeg for MOV/MP4
 
@@ -243,14 +309,14 @@ Rust, FLTK, the JPEG code and ALSA are all linked in. Only the system X11, fontc
 ```sh
 sudo apt install cmake ninja-build g++ pkg-config autoconf automake libtool \
   libx11-dev libxext-dev libxinerama-dev libxcursor-dev libxrender-dev libxfixes-dev libxft-dev libfontconfig1-dev
-./build_screenreel_v1.2.0.sh native            # -> dist/screenreel_v1.2.0-linux-x86_64-glibc
-./build_screenreel_v1.2.0.sh selftest dist/screenreel_v1.2.0-linux-x86_64-glibc
+./build_screenreel_v1.3.0.sh native            # -> dist/screenreel_v1.3.0-linux-x86_64-glibc
+./build_screenreel_v1.3.0.sh selftest dist/screenreel_v1.3.0-linux-x86_64-glibc
 ```
 
 ### Fully static Linux (musl)
 
 ```sh
-./build_screenreel_v1.2.0.sh linux-static      # needs podman or docker; builds inside alpine:3.20
+./build_screenreel_v1.3.0.sh linux-static      # needs podman or docker; builds inside alpine:3.20
 ```
 
 The script:
@@ -264,9 +330,9 @@ The script:
 | Method | Command |
 |---|---|
 | Native (MSVC) | `set RUSTFLAGS=-C target-feature=+crt-static` then `cargo build --release`. Static CRT, so no VC++ redistributable is needed. |
-| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.2.0.sh windows` |
+| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.3.0.sh windows` |
 
-CI (`.github/workflows/screenreel_v1.2.0.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
+CI (`.github/workflows/screenreel_v1.3.0.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
 
 ### Command line
 
@@ -373,10 +439,29 @@ export thread ─ Matroska muxer, cancellable, progress in permille
 - Compaction writes new files under a new name, `fsync`s them, then saves `project.txt`. A crash at any point leaves a valid project, either old or new. Old media is deleted only after the save succeeds.
 - Export, the dead-air scan and compaction all run as one cancellable background job with progress. Quitting asks before cancelling it.
 
+### Audit notes (v1.3.0)
+
+**Correctness**
+- **Loudness meter:** checked against BS.1770 reference behaviour in `--selftest`. A stereo −20 dBFS 997 Hz tone reads −20.00 LUFS, and mono reads the same as its stereo equivalent. Silence is gated out (returns `None`, no divide-by-zero).
+- **Limiter:** a sliding-window minimum gives O(n) look-ahead. A hard `min(env, need)` on every sample guarantees the ceiling: a +12 dB overdriven tone stays under −1 dBFS.
+- **Compressor:** the steady-state gain matches the static curve (thr −20 / 4:1 on a −6 dBFS tone gives −16.6 dBFS out, theory −16.5). The tube stage is unity at low level and DC-free. Parameters are clamped and NaN-safe (`sanitized`).
+- **Hard clipping removed:** `clamp(-1,1)` in playback, MKV and WAV export was replaced by a smooth −1 dBFS ceiling.
+- **UI:** `/` in menu item text is FLTK's submenu separator, so the dialogs avoid it.
+
+**Concurrency and UX**
+- **Audition** goes through the existing lock-free mixer handoff (`try_lock` on the audio thread). The override is dropped on Cancel, Apply, New and Open, so a preview can't leak into an export.
+- **Re-processing** while auditioning is debounced by 0.3 s, with a generation counter, so slider drags don't queue work.
+- **Level meter:** the audio thread publishes peaks with `fetch_max` on the f32 bit pattern (valid for non-negative floats). The UI applies ballistics at 60 Hz. No locks on the real-time path.
+
+**Performance**
+- The compressor is O(n), with one `log10` and one `powf` per frame: 3 s of audio takes about 6 ms, and 10 minutes about 1 s.
+- Loudness measurement is O(n) with two biquads per channel.
+
 ### Known limitations and roadmap
 
 - MJPEG files are larger than H.264, roughly 2–8 MB/s at 1080p30 depending on content and preset. Use Half-res or Draft for long recordings, and MP4 export for sharing.
 - Audio tracks are held in RAM: about 5.7 MB per minute for a mono track.
+- The compressor and normalization render offline (applied with undo). The compressor isn't a real-time insert on the mic while recording.
 - Speeding up and dead-air removal operate on whole video frames (1/fps). The audio is cut on the same boundaries.
 - Compact project flattens the edit (it becomes one segment), and undo history is cleared.
 - System audio records the default output only. Choosing a specific output, or a single app's audio, is not supported yet.
@@ -385,6 +470,13 @@ export thread ─ Matroska muxer, cancellable, progress in permille
 ---
 
 ## 9. Changelog
+
+**1.3.0** (2026-11-27):
+- **Opto compressor** (warm CL 1B-style) for the mic or any track: soft-knee optical cell with program-dependent release and a tube warmth stage; 5 presets, live transfer curve, A/B audition on the video, one-step apply
+- **Normalize levels**: BS.1770 gated LUFS normalization of all or the selected track to −14/−16/−19/−23 LUFS, with a −1 dBFS look-ahead limiter
+- **Output level meter** with peak hold; **soft −1 dBFS ceiling** instead of hard clipping in playback and exports
+- **New UI**: every control moved into one dark, grouped dock under the preview (RECORD · PROJECT/EXPORT · PLAY/EDIT · TRACK · TOOLS); fixed widths (no stretched buttons on wide screens); colour-coded roles; tooltips with shortcuts
+- `--selftest` adds loudness, limiter-ceiling, compressor gain and tube-stage checks
 
 **1.2.0** (2026-11-27):
 - Fix: **MOV/MP4 export greyed out** when ffmpeg wasn't on PATH (typical on Windows). ScreenReel now searches common install locations, remembers **Locate ffmpeg…**, honours `SCREENREEL_FFMPEG` and explains how to install ffmpeg

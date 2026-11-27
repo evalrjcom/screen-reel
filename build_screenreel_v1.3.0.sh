@@ -1,18 +1,18 @@
 #!/bin/sh
-# build_screenreel_v1.2.0.sh — build helper for ScreenReel v1.2.0
+# build_screenreel_v1.3.0.sh — build helper for ScreenReel v1.3.0
 #
-#   ./build_screenreel_v1.2.0.sh native        # portable glibc build: Rust/FLTK/JPEG/ALSA static,
+#   ./build_screenreel_v1.3.0.sh native        # portable glibc build: Rust/FLTK/JPEG/ALSA static,
 #                                              #   only system X11 + fontconfig/freetype + libc dynamic
-#   ./build_screenreel_v1.2.0.sh linux-static  # fully static musl ELF (runs inside alpine via podman/docker,
+#   ./build_screenreel_v1.3.0.sh linux-static  # fully static musl ELF (runs inside alpine via podman/docker,
 #                                              #   or directly when already on Alpine)
-#   ./build_screenreel_v1.2.0.sh windows       # static .exe via mingw-w64 cross (x86_64-pc-windows-gnu)
-#   ./build_screenreel_v1.2.0.sh selftest      # headless capture/edit/export test under Xvfb
+#   ./build_screenreel_v1.3.0.sh windows       # static .exe via mingw-w64 cross (x86_64-pc-windows-gnu)
+#   ./build_screenreel_v1.3.0.sh selftest      # headless capture/edit/export test under Xvfb
 #
 # Output goes to ./dist/. Every step is idempotent; temporary changes (hidden .so
 # symlinks inside the Alpine container) never touch the host.
 set -eu
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 TAG="screenreel_v${VERSION}"
 ALSA_VER="1.2.12"
 HERE="$(cd "$(dirname "$0")" && pwd)"

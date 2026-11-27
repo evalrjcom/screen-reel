@@ -1,8 +1,8 @@
-# screenreel_v1.2.0.yml — CI for ScreenReel v1.2.0
+# screenreel_v1.3.0.yml — CI for ScreenReel v1.3.0
 # Produces: fully static musl Linux ELF, static-CRT Windows .exe, portable glibc build,
 # and runs the headless --selftest (capture -> edit -> MKV export -> ffmpeg decode),
 # plus a system-audio (loopback) capture test against a private PulseAudio null sink.
-name: screenreel_v1.2.0
+name: screenreel_v1.3.0
 
 on:
   push:
@@ -23,10 +23,10 @@ jobs:
       - name: Build fully static musl binary
         run: |
           mkdir -p /src && cp -a . /src && cd /src
-          ./build_screenreel_v1.2.0.sh linux-static
+          ./build_screenreel_v1.3.0.sh linux-static
           mkdir -p "$GITHUB_WORKSPACE/dist" && cp dist/* "$GITHUB_WORKSPACE/dist/"
       - uses: actions/upload-artifact@v4
-        with: { name: screenreel_v1.2.0-linux-x86_64-static, path: dist/screenreel_v1.2.0-linux-x86_64-static }
+        with: { name: screenreel_v1.3.0-linux-x86_64-static, path: dist/screenreel_v1.3.0-linux-x86_64-static }
 
   linux-glibc-and-selftest:
     runs-on: ubuntu-22.04
@@ -40,11 +40,11 @@ jobs:
             libfontconfig1-dev xvfb ffmpeg pulseaudio pulseaudio-utils
       - uses: dtolnay/rust-toolchain@stable
       - name: Build portable glibc binary
-        run: ./build_screenreel_v1.2.0.sh native
+        run: ./build_screenreel_v1.3.0.sh native
       - name: Headless self-test
-        run: ./build_screenreel_v1.2.0.sh selftest dist/screenreel_v1.2.0-linux-x86_64-glibc
+        run: ./build_screenreel_v1.3.0.sh selftest dist/screenreel_v1.3.0-linux-x86_64-glibc
       - uses: actions/upload-artifact@v4
-        with: { name: screenreel_v1.2.0-linux-x86_64-glibc, path: dist/screenreel_v1.2.0-linux-x86_64-glibc }
+        with: { name: screenreel_v1.3.0-linux-x86_64-glibc, path: dist/screenreel_v1.3.0-linux-x86_64-glibc }
 
   windows:
     runs-on: windows-latest
@@ -59,9 +59,9 @@ jobs:
         shell: bash
         run: |
           ./target/release/screenreel.exe --version
-          mkdir -p dist && cp target/release/screenreel.exe dist/screenreel_v1.2.0-windows-x86_64.exe
+          mkdir -p dist && cp target/release/screenreel.exe dist/screenreel_v1.3.0-windows-x86_64.exe
       - uses: actions/upload-artifact@v4
-        with: { name: screenreel_v1.2.0-windows-x86_64, path: dist/screenreel_v1.2.0-windows-x86_64.exe }
+        with: { name: screenreel_v1.3.0-windows-x86_64, path: dist/screenreel_v1.3.0-windows-x86_64.exe }
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -72,5 +72,5 @@ jobs:
         with: { path: out, merge-multiple: true }
       - uses: softprops/action-gh-release@v2
         with:
-          name: ScreenReel v1.2.0
+          name: ScreenReel v1.3.0
           files: out/*
