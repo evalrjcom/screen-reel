@@ -1,18 +1,18 @@
 #!/bin/sh
-# build_screenreel_v1.0.0.sh — build helper for ScreenReel v1.0.0
+# build_screenreel_v1.1.0.sh — build helper for ScreenReel v1.1.0
 #
-#   ./build_screenreel_v1.0.0.sh native        # portable glibc build: Rust/FLTK/JPEG/ALSA static,
+#   ./build_screenreel_v1.1.0.sh native        # portable glibc build: Rust/FLTK/JPEG/ALSA static,
 #                                              #   only system X11 + fontconfig/freetype + libc dynamic
-#   ./build_screenreel_v1.0.0.sh linux-static  # fully static musl ELF (runs inside alpine via podman/docker,
+#   ./build_screenreel_v1.1.0.sh linux-static  # fully static musl ELF (runs inside alpine via podman/docker,
 #                                              #   or directly when already on Alpine)
-#   ./build_screenreel_v1.0.0.sh windows       # static .exe via mingw-w64 cross (x86_64-pc-windows-gnu)
-#   ./build_screenreel_v1.0.0.sh selftest      # headless capture/edit/export test under Xvfb
+#   ./build_screenreel_v1.1.0.sh windows       # static .exe via mingw-w64 cross (x86_64-pc-windows-gnu)
+#   ./build_screenreel_v1.1.0.sh selftest      # headless capture/edit/export test under Xvfb
 #
 # Output goes to ./dist/. Every step is idempotent; temporary changes (hidden .so
 # symlinks inside the Alpine container) never touch the host.
 set -eu
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 TAG="screenreel_v${VERSION}"
 ALSA_VER="1.2.12"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -144,7 +144,34 @@ cmd_selftest() {
         ffprobe -v error -show_entries stream=codec_name,width,height,sample_rate -of compact "$out/selftest.mkv"
         ffmpeg -v error -i "$out/selftest.mkv" -f null - && log "ffmpeg decode OK"
     fi
+    selftest_system_audio "$bin" "$out"
     rm -rf "$out"
+}
+
+# System-audio (loopback) test: private PulseAudio with a null sink, play a tone while
+# recording, require a non-silent stereo "System" track of exactly the video length.
+# Skipped (not failed) when pulseaudio/paplay/ffmpeg are not installed.
+selftest_system_audio() {
+    bin="$1"; out="$2"
+    for t in pulseaudio paplay ffmpeg; do
+        command -v "$t" >/dev/null 2>&1 || { log "system-audio test skipped (no $t)"; return 0; }
+    done
+    rt="$(mktemp -d)"; chmod 700 "$rt"
+    XDG_RUNTIME_DIR="$rt" pulseaudio --daemonize=yes --exit-idle-time=-1 -n \
+        --load=module-native-protocol-unix --load="module-null-sink sink_name=st_spk" >/dev/null 2>&1 \
+        || { log "system-audio test skipped (pulseaudio would not start)"; rm -rf "$rt"; return 0; }
+    sleep 1
+    XDG_RUNTIME_DIR="$rt" pactl set-default-sink st_spk
+    ffmpeg -v error -y -f lavfi -i "sine=frequency=660:duration=2" -ac 2 "$rt/tone.wav"
+    ( sleep 1; XDG_RUNTIME_DIR="$rt" paplay "$rt/tone.wav" ) &
+    pp=$!
+    rc=0
+    XDG_RUNTIME_DIR="$rt" DISPLAY=:87 "$bin" --selftest "$out/sys" 4 sys || rc=$?
+    wait "$pp" 2>/dev/null || true   # only the player: a bare `wait` would block on Xvfb
+    XDG_RUNTIME_DIR="$rt" pulseaudio -k >/dev/null 2>&1 || true
+    rm -rf "$rt"
+    [ "$rc" -eq 0 ] || die "system-audio self-test failed"
+    log "system-audio self-test OK"
 }
 
 case "${1:-}" in

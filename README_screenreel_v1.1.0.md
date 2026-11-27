@@ -1,13 +1,13 @@
-# ScreenReel v1.0.0 — User & Developer Guide
+# ScreenReel v1.1.0 — User & Developer Guide
 
 ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written in Rust and FLTK. It builds as a single binary for Linux and Windows.
 
 | | |
 |---|---|
-| Source | `screenreel_v1.0.0.rs` (single file, about 2,600 lines) |
-| Build helper | `build_screenreel_v1.0.0.sh` |
-| CI | `.github/workflows/screenreel_v1.0.0.yml` |
-| Binary size | about 4.7 MB (Linux, stripped, LTO) |
+| Source | `screenreel_v1.1.0.rs` (single file, about 3,000 lines) |
+| Build helper | `build_screenreel_v1.1.0.sh` |
+| CI | `.github/workflows/screenreel_v1.1.0.yml` |
+| Binary size | about 4.1–4.7 MB (Linux, stripped, LTO) |
 
 ---
 
@@ -17,6 +17,7 @@ ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written 
 |---|---|
 | Record the full screen or a region | X11 MIT-SHM capture on Linux (falls back to XGetImage). GDI BitBlt on Windows. The cursor is composited into the video. |
 | Microphone | Records directly into a **Mic** track that is sample-aligned to the video. |
+| System audio | Optional. Records what the computer is playing (a video, a browser tab, an app) into its own stereo **System** track, alongside the mic. Mute, swap, cut or re-level each track on its own. |
 | Visual timeline | Ruler, video lane (blue = recorded, orange = FREEZE) and one waveform lane per audio track. Includes selection, playhead, zoom and scroll. |
 | Cut | Ripple-deletes the selection from the video and from every audio track. |
 | Insert freeze | Holds the frame under the playhead for N seconds. Tracks get matching silence, which you can narrate over. |
@@ -41,8 +42,8 @@ Audio is 48 kHz 16-bit PCM throughout. Mixing tracks for export is plain sample 
 
 ## 2. Quick start
 
-1. Run the binary (`screenreel_v1.0.0-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.0.0-windows-x86_64.exe`).
-2. Pick an fps, a quality and a microphone in the top bar.
+1. Run the binary (`screenreel_v1.1.0-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.1.0-windows-x86_64.exe`).
+2. Pick an fps, a quality and a microphone in the top bar. Tick **System audio** to also record what the computer plays.
 3. Click **● Record Screen**, or **● Record Region** and drag a rectangle (Esc or right-click cancels).
 4. After a 3-2-1 countdown, a small **REC** bar shows elapsed time with **|| Pause** and **■ Stop**.
 5. Click **■ Stop**. The recording opens in the editor and is already saved as a project in `~/Videos/ScreenReel/rec_YYYYMMDD_HHMMSS/` (`%USERPROFILE%\Videos\ScreenReel\…` on Windows; the timestamp is in UTC).
@@ -57,6 +58,25 @@ Audio is 48 kHz 16-bit PCM throughout. Mixing tracks for export is plain sample 
 | Half-res | Applies a 2×2 box downscale before encoding. Use it for 4K screens: about 4× smaller files and 4× less CPU. |
 | Cursor | Composites the mouse pointer into the video. |
 | Mic | Off, the system default, or a named input device. |
+| System audio | Also record the computer's sound output (loopback) to a separate stereo **System** track. |
+
+### Recording system audio with the mic
+
+Tick **System audio** next to the mic picker. A recording then gets up to two tracks:
+- **Mic**: your voice, mono.
+- **System**: everything the computer plays through its default output, stereo.
+
+Things to know:
+- **Use headphones** when recording both. With speakers, the mic also picks up the system sound, so you hear it twice with a slight echo.
+- Silence is kept in its place. If nothing plays for a while, or you pause the recording, later sound still lines up with the video.
+- System audio follows the **default output device**. If you switch outputs (for example, plug in a headset) during a recording, capture stays on the original device. Pick your output before you press Record.
+- If system audio can't be opened, the recording continues without it and the status line says why.
+- Only record audio you have the right to use.
+
+| Platform | How system audio is captured |
+|---|---|
+| Windows | WASAPI loopback on the default output device. Nothing to set up. |
+| Linux | The default output's *monitor* source on PulseAudio or PipeWire (`pipewire-pulse`). Needs a running sound server. Plain ALSA has no loopback. |
 
 If the encoders can't keep up, a frame is duplicated rather than letting audio drift. The REC bar counts these, and the final status line reports the total.
 
@@ -144,7 +164,8 @@ Open a project with **Open…** (choose `project.txt`), or pass the folder on th
 ### Linux
 
 - Capture needs an **X11** session, or a Wayland session where `DISPLAY` points at XWayland. Under pure Wayland, XWayland can only see X11 windows.
-- Audio uses the pure-Rust PulseAudio protocol client first, so it works with PipeWire (through `pipewire-pulse`) and PulseAudio and needs no libpulse. If no Pulse server is running, it falls back to ALSA.
+- Audio uses the pure-Rust PulseAudio protocol client first, so it works with PipeWire (through `pipewire-pulse`) and PulseAudio and needs no libpulse. If no Pulse server is running, it falls back to ALSA (mic only: system audio needs the sound server).
+- Mic and system-audio capture open native Pulse record streams. They ask for 20 ms fragments with the server's full queue, and the server converts to 48 kHz. Preview playback uses a 20 ms period (about 40 ms of latency), so narration lines up with the picture.
 - In the fully static build, ALSA can't load `.so` plugins, so plain-ALSA systems should use `hw:`/`plughw:` devices.
 - On Linux the REC bar is captured if it's inside the recorded area. It is placed above or below the region when there's room. For full-screen recordings, cut it out afterwards or minimise it; recording continues.
 
@@ -167,36 +188,38 @@ Rust, FLTK, the JPEG code and ALSA are all linked in. Only the system X11, fontc
 ```sh
 sudo apt install cmake ninja-build g++ pkg-config autoconf automake libtool \
   libx11-dev libxext-dev libxinerama-dev libxcursor-dev libxrender-dev libxfixes-dev libxft-dev libfontconfig1-dev
-./build_screenreel_v1.0.0.sh native            # -> dist/screenreel_v1.0.0-linux-x86_64-glibc
-./build_screenreel_v1.0.0.sh selftest dist/screenreel_v1.0.0-linux-x86_64-glibc
+./build_screenreel_v1.1.0.sh native            # -> dist/screenreel_v1.1.0-linux-x86_64-glibc
+./build_screenreel_v1.1.0.sh selftest dist/screenreel_v1.1.0-linux-x86_64-glibc
 ```
 
 ### Fully static Linux (musl)
 
 ```sh
-./build_screenreel_v1.0.0.sh linux-static      # needs podman or docker; builds inside alpine:3.20
+./build_screenreel_v1.1.0.sh linux-static      # needs podman or docker; builds inside alpine:3.20
 ```
 
 The script:
 1. Installs Alpine's `*-static` X, fontconfig and freetype archives, building any missing X.Org library from its release tarball with `--enable-static`.
 2. Builds alsa-lib statically.
 3. Hides the `.so` dev symlinks inside the container. This forces fltk-sys's `dylib=X11…` requests to resolve to `.a` archives.
-4. Links with `+crt-static` and checks with `ldd` that nothing dynamic is left.
+4. Links a non-PIE `+crt-static` binary, resolving the X/font/C++ stack as one linker group, and checks with `readelf` that there is no interpreter and no `NEEDED` entry.
 
 ### Windows
 
 | Method | Command |
 |---|---|
 | Native (MSVC) | `set RUSTFLAGS=-C target-feature=+crt-static` then `cargo build --release`. Static CRT, so no VC++ redistributable is needed. |
-| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.0.0.sh windows` |
+| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.1.0.sh windows` |
 
-CI (`.github/workflows/screenreel_v1.0.0.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
+CI (`.github/workflows/screenreel_v1.1.0.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
 
 ### Command line
 
 ```
 screenreel [project_dir]                      open the editor (optionally with a project)
-screenreel --selftest <outdir> [secs] [full]  headless capture → edit → save/load → export → verify
+screenreel --selftest <outdir> [secs] [full] [sys]
+                                              headless capture → edit → save/load → export → verify;
+                                              `sys` also records system audio and requires it to be non-silent
 screenreel --probe-audio <file>               check that a file imports (channels/duration)
 screenreel --version
 ```
@@ -210,11 +233,15 @@ capture thread ──(bounded, try_send)──► N JPEG encoder workers ──(
    │  wall-clock scheduler, pause-aware            │ jpeg-encoder (AVX2)           │ re-orders by seq,
    │  emits Dup(seq) when behind/full ─────────────┼──────────────────────────────►│ appends frames.mjpg,
    └ buffer pool ◄──── raw frame buffers recycled ─┘                               │ duplicates = repeated index entries (0 bytes)
-cpal input stream ─► mono i16 chunks (pause-aware) ─► resample to 48 kHz ─► fit to frames × (48000/fps)
+audio capture (mic mono, system stereo):
+  Linux: native Pulse record stream (pulse-rec thread, s16/48 kHz from the server)
+  Windows/ALSA: cpal input stream (WASAPI loopback for system) ─► resample to 48 kHz
+  └► Placer: chunks placed on the PauseClock's active time; gaps > 200 ms become silence
+     └► on stop: wait for the last fragment, trim to the stop instant, fit to frames × (48000/fps)
 
 UI thread (FLTK) ─ 60 Hz tick: playback clock, decoder results, export progress, REC status
 preview decoder thread ─ latest-request-wins JPEG decode (zune-jpeg) + 2×2 averaged downscale
-cpal output stream ─ real-time mixer (try_lock, never blocks), audio clock drives the playhead
+cpal output stream ─ real-time mixer (try_lock, never blocks); playhead = the sample being heard (queued position minus device delay)
 export thread ─ Matroska muxer, cancellable, progress in permille
 ```
 
@@ -244,15 +271,46 @@ export thread ─ Matroska muxer, cancellable, progress in permille
 - X11 SHM segments are marked `IPC_RMID` right after attach, so they can't leak if the process crashes.
 - GDI handles and the `GetIconInfo` bitmaps are freed; the cursor hotspot is cached per handle.
 
+### Audit notes (v1.1.0)
+
+**Bugs found and fixed while adding system audio**
+- **Linux mic capture through cpal's Pulse backend** had three problems:
+  - With the default buffer, the server picked fragments of about 2 s. Audio arrived in bursts and the buffered tail (up to about 2 s) was lost at Stop.
+  - With a fixed buffer, cpal caps the server queue at one fragment, so any late read silently dropped audio. A 2.5 s tone came back as about 1.75 s.
+  - Fix: a native record stream (20 ms fragments, full server queue). The same test tone is now captured complete in every run.
+- **Preview A/V sync:** Pulse playback buffered about 2 s, so preview audio lagged the picture by about 2 s. That broke narration timing. Fix: a 20 ms period, and the playhead now reports the sample being heard.
+- **Gap placement:**
+  - A loopback source sends nothing while the output is idle. Audio after a silent stretch would have slid earlier than the video.
+  - Fix: chunks are placed on an active-time clock that excludes pauses, and real gaps become silence.
+  - On Windows the capture timestamp comes from the WASAPI hardware clock (QPC). On Linux the native stream's 20 ms fragments arrive as they're captured.
+  - Drift can't build up into false gaps, because placement re-anchors on every chunk.
+- **Stop:** each source gets 80 ms to deliver its last fragment. Anything captured after the Stop instant is trimmed off.
+
+**Security and robustness**
+- The Pulse reader bounds packet size (16 MiB) and keeps frames aligned across packets.
+- It exits on a socket error or a server "stream killed" message.
+- Stop closes the socket, which unblocks the reader, and then joins it.
+- The handshake has a 3 s timeout.
+- Errors from either audio source never abort a recording. The source is dropped and the reason shown.
+
 ### Known limitations and roadmap
 
 - MJPEG files are larger than H.264, roughly 2–8 MB/s at 1080p30 depending on content and preset. Use Half-res or Draft for long recordings, and MP4 export for sharing.
 - Audio tracks are held in RAM: about 5.7 MB per minute for a mono track.
-- Planned: Wayland capture through the xdg-desktop-portal/PipeWire screencast, webcam overlay, text and arrow annotations, global hotkeys, and system-audio (loopback) capture.
+- System audio records the default output only. Choosing a specific output, or a single app's audio, is not supported yet.
+- Planned: Wayland capture through the xdg-desktop-portal/PipeWire screencast, webcam overlay, text and arrow annotations, global hotkeys, and per-app audio capture.
 
 ---
 
 ## 9. Changelog
+
+**1.1.0** (2026-11-27):
+- **System audio** checkbox: records the computer's sound output to its own stereo **System** track, next to the mic (WASAPI loopback on Windows, default-sink monitor on PulseAudio/PipeWire on Linux)
+- Linux mic and system capture use a native Pulse record stream: no more ~2 s bursts, dropped audio or lost tail
+- Audio placement survives idle output and pause/resume; the end is trimmed to the exact stop time
+- Preview playback latency on Linux cut from ~2 s to ~40 ms; the playhead follows the audible sample
+- `--selftest … sys`, plus a CI system-audio test on a private PulseAudio null sink
+- Static musl build fixed (compiler aliases, linker group, non-PIE static link)
 
 **1.0.0** (2026-11-25) — First release:
 - full-screen and region capture with cursor

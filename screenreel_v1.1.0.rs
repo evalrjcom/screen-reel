@@ -1,5 +1,5 @@
-//! ScreenReel v1.0.0 — lightweight screen recorder + editor (Rust + FLTK)
-//! File: screenreel_v1.0.0.rs
+//! ScreenReel v1.1.0 — lightweight screen recorder + editor (Rust + FLTK)
+//! File: screenreel_v1.1.0.rs
 //!
 //! Design summary
 //! --------------
@@ -15,6 +15,14 @@
 //!
 //! Changelog
 //! ---------
+//! 1.1.0  System audio ("System audio" checkbox): records what the computer plays to
+//!        its own stereo "System" track alongside the mic (WASAPI loopback on Windows,
+//!        default-sink monitor via native Pulse/PipeWire stream on Linux). Linux mic and
+//!        system capture use a native Pulse record stream (fixes ~2 s bursts, dropped
+//!        audio and lost tail with cpal's Pulse backend); gap filling keeps audio in sync
+//!        across idle output and pause/resume; tail trimmed to the exact stop time.
+//!        Preview playback latency on Pulse cut from ~2 s to ~40 ms and the playhead now
+//!        follows the audible sample. --selftest ... sys.
 //! 1.0.0  Initial release: full/region capture, mic, timeline, cut/freeze,
 //!        narration re-record, track add/swap/remove/shift, MKV/MOV/MP4/WAV export,
 //!        project save/load, --selftest harness.
@@ -40,8 +48,8 @@ use fltk::{
 };
 
 // Every in-file version reference derives from these two constants (bump together).
-const VERSION: &str = "1.0.0";
-const FILE_TAG: &str = "screenreel_v1.0.0";
+const VERSION: &str = "1.1.0";
+const FILE_TAG: &str = "screenreel_v1.1.0";
 const APP_NAME: &str = "ScreenReel";
 const AR: u32 = 48_000; // canonical project audio rate
 const FPS_CHOICES: [u32; 8] = [10, 15, 20, 24, 25, 30, 50, 60]; // all divide 48000 exactly
@@ -547,50 +555,330 @@ fn find_input(name: Option<&str>) -> Res<cpal::Device> {
     host.default_input_device().ok_or_else(|| "no microphone / input device found".to_string())
 }
 
-/// Microphone capture: mono i16 at device rate, chunks shipped over a channel.
-struct MicCapture { stream: cpal::Stream, rx: Receiver<Vec<i16>>, rate: u32 }
+/// System-audio ("what you hear") device for the cpal path.
+/// Windows: WASAPI loopback - opening the default *output* device as an input enables it.
+#[cfg(windows)]
+fn find_loopback() -> Res<(cpal::Device, cpal::SupportedStreamConfig)> {
+    let host = cpal::default_host();
+    let dev = host.default_output_device().ok_or("no audio output device to capture from")?;
+    let sc = dev.default_output_config().map_err(|e| format!("system audio config: {e}"))?;
+    Ok((dev, sc))
+}
 
-impl MicCapture {
-    fn start(name: Option<&str>, paused: Arc<AtomicBool>) -> Res<Self> {
-        let dev = find_input(name)?;
-        let sc = dev.default_input_config().map_err(|e| format!("mic config: {e}"))?;
-        let cfg = sc.config();
-        let (tx, rx) = mpsc::channel();
-        let stream = match sc.sample_format() {
-            cpal::SampleFormat::F32 => Self::build::<f32>(&dev, &cfg, tx, paused),
-            cpal::SampleFormat::I16 => Self::build::<i16>(&dev, &cfg, tx, paused),
-            cpal::SampleFormat::I32 => Self::build::<i32>(&dev, &cfg, tx, paused),
-            cpal::SampleFormat::U16 => Self::build::<u16>(&dev, &cfg, tx, paused),
-            cpal::SampleFormat::U8 => Self::build::<u8>(&dev, &cfg, tx, paused),
-            cpal::SampleFormat::I8 => Self::build::<i8>(&dev, &cfg, tx, paused),
-            cpal::SampleFormat::F64 => Self::build::<f64>(&dev, &cfg, tx, paused),
-            f => Err(format!("unsupported mic sample format {f:?}")),
-        }?;
-        stream.play().map_err(|e| format!("mic start: {e}"))?;
-        Ok(MicCapture { stream, rx, rate: cfg.sample_rate })
+/// Linux without a Pulse/PipeWire server: plain ALSA has no generic loopback.
+#[cfg(not(windows))]
+fn find_loopback() -> Res<(cpal::Device, cpal::SupportedStreamConfig)> {
+    Err("system audio needs PulseAudio or PipeWire (no sound server found)".into())
+}
+
+/// Pause state + "active time" clock shared by the video capture thread and the audio
+/// readers. `active()` = wall time since creation minus time spent paused; audio uses it
+/// to place samples after silent stretches (idle loopback, pause/resume) without drift.
+struct PauseClock { flag: AtomicBool, st: Mutex<(Instant, Duration, Option<Instant>)> } // (t0, paused total, paused since)
+
+impl Default for PauseClock {
+    fn default() -> Self { PauseClock { flag: AtomicBool::new(false), st: Mutex::new((Instant::now(), Duration::ZERO, None)) } }
+}
+
+impl PauseClock {
+    #[inline] fn is(&self) -> bool { self.flag.load(Relaxed) }
+    fn set(&self, p: bool) {
+        let mut g = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match (p, g.2) {
+            (true, None) => g.2 = Some(now),
+            (false, Some(since)) => { g.1 += now - since; g.2 = None; }
+            _ => {}
+        }
+        self.flag.store(p, Relaxed); // updated under the lock: active() never sees a torn state
+    }
+    fn toggle(&self) -> bool { let p = !self.is(); self.set(p); p }
+    fn active(&self, now: Instant) -> f64 {
+        let g = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let paused = g.1 + g.2.map(|s| now.saturating_duration_since(s)).unwrap_or_default();
+        now.saturating_duration_since(g.0).saturating_sub(paused).as_secs_f64()
+    }
+}
+
+/// Places captured chunks on the recorder's active clock and fills real gaps with silence.
+///
+/// Loopback sources deliver *nothing* while nothing is playing (WASAPI always; Pulse when
+/// the sink is suspended), and any source can stall. Without care, audio after a silent
+/// stretch slides earlier than the video. A chunk that started > 200 ms after the previous
+/// chunk ended gets that gap inserted as silence. The placement is anchored at stream open,
+/// so silence before the first sound is kept too. It re-anchors on every chunk, so slow
+/// device-clock drift never accumulates into false gaps (fit_len absorbs drift at the end).
+/// `end` (active-clock time of the last sample) lets `finish` trim to the exact stop time.
+struct Placer { next: f64, rate: f64, end: Arc<Mutex<f64>> }
+
+impl Placer {
+    fn new(clock: &PauseClock, rate: u32) -> (Self, Arc<Mutex<f64>>) {
+        let next = clock.active(Instant::now());
+        let end = Arc::new(Mutex::new(next));
+        (Placer { next, rate: rate.max(1) as f64, end: end.clone() }, end)
+    }
+    /// `start`: active-clock time of the chunk's first frame; `n`: frames in the chunk.
+    /// Returns the silent frames to insert before the chunk.
+    fn place(&mut self, start: f64, n: usize) -> usize {
+        let gap = start - self.next;
+        let fill = if gap > 0.2 { (gap.min(3600.0) * self.rate) as usize } else { 0 };
+        self.next = start + n as f64 / self.rate;
+        *self.end.lock().unwrap_or_else(|e| e.into_inner()) = self.next;
+        fill
+    }
+}
+
+/// Native PulseAudio / PipeWire-pulse record stream (Linux), over the pure-Rust `pulseaudio`
+/// protocol crate (no libpulse, stays fully static).
+///
+/// Why not cpal here: cpal's Pulse backend either lets the server choose multi-second
+/// fragments (audio arrives in bursts, timestamps unreliable, the buffered tail is lost at
+/// stop), or, with a fixed buffer, caps the server queue at one fragment so any late read
+/// overflows and drops audio. Like `parec`, this asks for small 20 ms fragments with the
+/// server's maximum queue, and has the server convert to s16 / 48 kHz / 1-2 ch for us.
+#[cfg(target_os = "linux")]
+mod pulse_rec {
+    use super::Res;
+    use pulseaudio::protocol as pa;
+    use std::ffi::CString;
+    use std::io::{BufReader, Read};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    pub enum Src<'a> { Mic(Option<&'a str>), Monitor }
+
+    pub struct Reader { ctl: UnixStream, th: Option<JoinHandle<()>> }
+
+    impl Reader {
+        /// Closing the socket unblocks the reader thread, which then exits.
+        pub fn stop(mut self) { self.shutdown(); }
+        fn shutdown(&mut self) {
+            let _ = self.ctl.shutdown(Shutdown::Both);
+            if let Some(t) = self.th.take() { let _ = t.join(); }
+        }
+    }
+    impl Drop for Reader { fn drop(&mut self) { self.shutdown(); } }
+
+    pub fn available() -> bool { pulseaudio::socket_path_from_env().map(|p| p.exists()).unwrap_or(false) }
+
+    fn pe(e: impl std::fmt::Display) -> String { format!("pulse: {e}") }
+
+    fn connect() -> Res<(BufReader<UnixStream>, u16)> {
+        let path = pulseaudio::socket_path_from_env().ok_or("no PulseAudio/PipeWire socket")?;
+        let s = UnixStream::connect(&path).map_err(|e| format!("connect {}: {e}", path.display()))?;
+        // Handshake must not hang forever on a wedged server; cleared once streaming.
+        s.set_read_timeout(Some(Duration::from_secs(3))).map_err(pe)?;
+        let mut sock = BufReader::new(s);
+        let cookie = pulseaudio::cookie_path_from_env().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
+        let auth = pa::AuthParams { version: pa::MAX_VERSION, supports_shm: false, supports_memfd: false, cookie };
+        pa::write_command_message(sock.get_mut(), 0, &pa::Command::Auth(auth), pa::MAX_VERSION).map_err(pe)?;
+        let (_, reply) = pa::read_reply_message::<pa::AuthReply>(&mut sock, pa::MAX_VERSION).map_err(pe)?;
+        let ver = pa::MAX_VERSION.min(reply.version);
+        let mut props = pa::Props::new();
+        props.set(pa::Prop::ApplicationName, CString::new(super::APP_NAME).unwrap_or_default());
+        pa::write_command_message(sock.get_mut(), 1, &pa::Command::SetClientName(props), ver).map_err(pe)?;
+        let _ = pa::read_reply_message::<pa::SetClientNameReply>(&mut sock, ver).map_err(pe)?;
+        Ok((sock, ver))
     }
 
-    fn build<T>(dev: &cpal::Device, cfg: &cpal::StreamConfig, tx: Sender<Vec<i16>>, paused: Arc<AtomicBool>) -> Res<cpal::Stream>
+    /// Open a record stream delivering interleaved s16 at 48 kHz with `ch` channels.
+    /// `on_data(samples)` runs on the reader thread for every fragment, in order.
+    pub fn open(src: Src, ch: u8, mut on_data: impl FnMut(&[i16]) + Send + 'static) -> Res<Reader> {
+        let (mut sock, ver) = connect()?;
+        let (source_index, source_name) = match src {
+            Src::Monitor => {
+                let q = pa::GetSinkInfo { index: None, name: Some(pa::DEFAULT_SINK.to_owned()) };
+                pa::write_command_message(sock.get_mut(), 2, &pa::Command::GetSinkInfo(q), ver).map_err(pe)?;
+                let (_, sink) = pa::read_reply_message::<pa::SinkInfo>(&mut sock, ver).map_err(|e| format!("default output: {e}"))?;
+                (Some(sink.monitor_source_index.ok_or("default output has no monitor source")?), None)
+            }
+            Src::Mic(Some(n)) => {
+                pa::write_command_message(sock.get_mut(), 2, &pa::Command::GetSourceInfoList, ver).map_err(pe)?;
+                let (_, list) = pa::read_reply_message::<pa::SourceInfoList>(&mut sock, ver).map_err(pe)?;
+                let hit = list.iter().find(|s| {
+                    s.description.as_ref().map(|d| d.to_string_lossy() == n).unwrap_or(false) || s.name.to_string_lossy() == n
+                });
+                match hit { Some(s) => (Some(s.index), None), None => (None, Some(pa::DEFAULT_SOURCE.to_owned())) }
+            }
+            Src::Mic(None) => (None, Some(pa::DEFAULT_SOURCE.to_owned())),
+        };
+        let frag = 48_000 / 50 * ch as u32 * 2; // 20 ms of s16
+        let params = pa::RecordStreamParams {
+            sample_spec: pa::SampleSpec { format: pa::SampleFormat::S16Le, channels: ch, sample_rate: super::AR },
+            channel_map: if ch == 2 { pa::ChannelMap::stereo() } else { pa::ChannelMap::mono() },
+            source_index, source_name,
+            buffer_attr: pa::stream::BufferAttr { fragment_size: frag, ..Default::default() }, // max_length = server max
+            flags: pa::stream::StreamFlags { adjust_latency: true, ..Default::default() },
+            props: { let mut p = pa::Props::new(); p.set(pa::Prop::MediaName, CString::new("Screen recording").unwrap_or_default()); p },
+            ..Default::default()
+        };
+        pa::write_command_message(sock.get_mut(), 3, &pa::Command::CreateRecordStream(params), ver).map_err(pe)?;
+        let (_, st) = pa::read_reply_message::<pa::CreateRecordStreamReply>(&mut sock, ver).map_err(|e| format!("open record stream: {e}"))?;
+        if st.sample_spec.format != pa::SampleFormat::S16Le || st.sample_spec.channels != ch || st.sample_spec.sample_rate != super::AR {
+            return Err(format!("server gave unexpected format {:?}", st.sample_spec));
+        }
+        sock.get_ref().set_read_timeout(None).map_err(pe)?;
+        let ctl = sock.get_ref().try_clone().map_err(pe)?;
+        let th = thread::Builder::new().name("pulse-rec".into()).spawn(move || {
+            let fb = 2 * ch as usize;         // bytes per frame (s16)
+            let mut pend: Vec<u8> = Vec::new(); // received bytes not yet forming whole frames
+            let mut smp: Vec<i16> = Vec::new();
+            loop {
+                let Ok(d) = pa::read_descriptor(&mut sock) else { break };
+                if d.channel == u32::MAX {
+                    // control message (overflow/started/moved/killed...): consume; stop if killed
+                    match pa::Command::read_tag_prefixed(&mut sock, ver) {
+                        Ok((_, pa::Command::RecordStreamKilled(_))) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+                let len = d.length as usize;
+                if len > 16 << 20 { break; } // corrupt framing guard
+                let old = pend.len();
+                pend.resize(old + len, 0);
+                if sock.read_exact(&mut pend[old..]).is_err() { break; }
+                if d.channel != st.channel { pend.truncate(old); continue; }
+                let whole = pend.len() / fb * fb;
+                if whole == 0 { continue; }
+                smp.clear();
+                smp.extend(pend[..whole].chunks_exact(2).map(|p| i16::from_le_bytes([p[0], p[1]])));
+                pend.drain(..whole);
+                on_data(&smp);
+            }
+        }).map_err(pe)?;
+        Ok(Reader { ctl, th: Some(th) })
+    }
+}
+
+/// Which device an `AudioCapture` records from.
+#[derive(Clone, Copy)]
+enum AudioSrc<'a> { Mic(Option<&'a str>), System }
+
+enum CapInner { Cpal(cpal::Stream), #[cfg(target_os = "linux")] Pulse(pulse_rec::Reader) }
+
+/// Audio capture (mic or system loopback): interleaved i16, chunks shipped over a channel.
+/// Mic is mono; system audio is stereo. Linux uses a native Pulse/PipeWire stream when a
+/// sound server is running (falls back to cpal/ALSA for the mic); Windows uses WASAPI.
+struct AudioCapture { inner: CapInner, rx: Receiver<Vec<i16>>, rate: u32, ch: u16, end: Arc<Mutex<f64>> }
+
+impl AudioCapture {
+    fn start(src: AudioSrc, clock: Arc<PauseClock>) -> Res<Self> {
+        #[cfg(target_os = "linux")]
+        if pulse_rec::available() {
+            match Self::start_pulse(src, clock.clone()) {
+                Ok(c) => return Ok(c),
+                // System audio exists only via the sound server; the mic can still try ALSA.
+                Err(e) if matches!(src, AudioSrc::System) => return Err(e),
+                Err(e) => eprintln!("[mic] {e}; falling back to ALSA"),
+            }
+        }
+        Self::start_cpal(src, clock)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_pulse(src: AudioSrc, clock: Arc<PauseClock>) -> Res<Self> {
+        let (ch, psrc, what) = match src {
+            AudioSrc::Mic(n) => (1u8, pulse_rec::Src::Mic(n), "mic"),
+            AudioSrc::System => (2u8, pulse_rec::Src::Monitor, "system audio"),
+        };
+        let (tx, rx) = mpsc::channel();
+        let (mut placer, end) = Placer::new(&clock, AR);
+        let rate = AR as f64;
+        let reader = pulse_rec::open(psrc, ch, move |s: &[i16]| {
+            if clock.is() { return; }
+            let n = s.len() / ch as usize;
+            // fragments arrive ~as captured (20 ms, dedicated reader): start = now - duration
+            let start = clock.active(Instant::now()) - n as f64 / rate;
+            let fill = placer.place(start, n);
+            let mut v = Vec::with_capacity((fill + n) * ch as usize);
+            v.resize(fill * ch as usize, 0);
+            v.extend_from_slice(s);
+            let _ = tx.send(v);
+        }).map_err(|e| format!("{what}: {e}"))?;
+        Ok(AudioCapture { inner: CapInner::Pulse(reader), rx, rate: AR, ch: ch as u16, end })
+    }
+
+    fn start_cpal(src: AudioSrc, clock: Arc<PauseClock>) -> Res<Self> {
+        let (what, dev, sc) = match src {
+            AudioSrc::Mic(name) => {
+                let dev = find_input(name)?;
+                let sc = dev.default_input_config().map_err(|e| format!("mic config: {e}"))?;
+                ("mic", dev, sc)
+            }
+            AudioSrc::System => { let (d, c) = find_loopback()?; ("system audio", d, c) }
+        };
+        let mut cfg = sc.config();
+        cfg.buffer_size = cpal::BufferSize::Default;
+        let out_ch: u16 = if matches!(src, AudioSrc::System) && cfg.channels >= 2 { 2 } else { 1 };
+        let (tx, rx) = mpsc::channel();
+        let (placer, end) = Placer::new(&clock, cfg.sample_rate);
+        let a = (out_ch, what);
+        let stream = match sc.sample_format() {
+            cpal::SampleFormat::F32 => Self::build::<f32>(&dev, &cfg, a, tx, clock, placer),
+            cpal::SampleFormat::I16 => Self::build::<i16>(&dev, &cfg, a, tx, clock, placer),
+            cpal::SampleFormat::I32 => Self::build::<i32>(&dev, &cfg, a, tx, clock, placer),
+            cpal::SampleFormat::U16 => Self::build::<u16>(&dev, &cfg, a, tx, clock, placer),
+            cpal::SampleFormat::U8 => Self::build::<u8>(&dev, &cfg, a, tx, clock, placer),
+            cpal::SampleFormat::I8 => Self::build::<i8>(&dev, &cfg, a, tx, clock, placer),
+            cpal::SampleFormat::F64 => Self::build::<f64>(&dev, &cfg, a, tx, clock, placer),
+            f => Err(format!("unsupported {what} sample format {f:?}")),
+        }?;
+        stream.play().map_err(|e| format!("{what} start: {e}"))?;
+        Ok(AudioCapture { inner: CapInner::Cpal(stream), rx, rate: cfg.sample_rate, ch: out_ch, end })
+    }
+
+    fn build<T>(dev: &cpal::Device, cfg: &cpal::StreamConfig, (out_ch, what): (u16, &'static str),
+                tx: Sender<Vec<i16>>, clock: Arc<PauseClock>, mut placer: Placer) -> Res<cpal::Stream>
     where T: SizedSample + Send + 'static, f32: FromSample<T> {
         let ch = (cfg.channels as usize).max(1);
-        dev.build_input_stream::<T, _, _>(*cfg, move |data: &[T], _| {
-            if paused.load(Relaxed) { return; }
-            let mut v = Vec::with_capacity(data.len() / ch);
+        let oc = out_ch as usize;
+        dev.build_input_stream::<T, _, _>(*cfg, move |data: &[T], info: &cpal::InputCallbackInfo| {
+            if clock.is() { return; }
+            let n = data.len() / ch;
+            // Capture time of the first frame: stream-clock delay mapped onto Instant
+            // (WASAPI reports hardware QPC positions, so this is accurate even for bursts).
+            let ts = info.timestamp();
+            let now = Instant::now();
+            let delay = ts.callback.saturating_duration_since(ts.capture);
+            let start = clock.active(now.checked_sub(delay).unwrap_or(now));
+            let fill = placer.place(start, n);
+            let mut v = Vec::with_capacity((fill + n) * oc);
+            v.resize(fill * oc, 0);
             for fr in data.chunks_exact(ch) {
-                let s: f32 = fr.iter().map(|&x| f32::from_sample(x)).sum::<f32>() / ch as f32;
-                v.push(f2i(s));
+                if oc == 2 {
+                    v.push(f2i(f32::from_sample(fr[0])));
+                    v.push(f2i(f32::from_sample(fr[1])));
+                } else {
+                    let s: f32 = fr.iter().map(|&x| f32::from_sample(x)).sum::<f32>() / ch as f32;
+                    v.push(f2i(s));
+                }
             }
             let _ = tx.send(v);
-        }, |e| eprintln!("[mic] stream error: {e}"), None).map_err(|e| format!("mic open: {e}"))
+        }, move |e| eprintln!("[{what}] stream error: {e}"), None).map_err(|e| format!("{what} open: {e}"))
     }
 
-    /// Stop and return mono samples resampled to 48 kHz.
-    fn finish(self) -> Vec<i16> {
-        let MicCapture { stream, rx, rate } = self;
-        drop(stream); // stops callbacks, drops the Sender
+    /// Stop and return (channels, interleaved samples at 48 kHz). With `stop_at` (active-clock
+    /// time the user pressed stop) the source gets a moment to deliver its last fragment and
+    /// anything captured after that instant is trimmed off.
+    fn finish(self, stop_at: Option<f64>) -> (u16, Vec<i16>) {
+        let AudioCapture { inner, rx, rate, ch, end } = self;
+        if stop_at.is_some() { thread::sleep(Duration::from_millis(80)); }
+        match inner {
+            CapInner::Cpal(s) => drop(s), // stops callbacks, drops the Sender
+            #[cfg(target_os = "linux")]
+            CapInner::Pulse(r) => r.stop(),
+        }
         let mut all = Vec::new();
         for c in rx.try_iter() { all.extend_from_slice(&c); }
-        resample(&all, 1, rate, AR)
+        let mut out = resample(&all, ch as usize, rate, AR);
+        if let Some(s) = stop_at {
+            let over = ((*end.lock().unwrap_or_else(|e| e.into_inner()) - s).max(0.0) * AR as f64) as usize;
+            let keep = (out.len() / ch as usize).saturating_sub(over);
+            out.truncate(keep * ch as usize);
+        }
+        (ch, out)
     }
 }
 
@@ -601,18 +889,19 @@ impl MicCapture {
 struct RecConfig {
     region: Rect, fps: u32, quality: u8, s444: bool, half: bool, cursor: bool,
     mic: Option<Option<String>>, // None = off; Some(None) = default device
+    sys: bool,                   // also record system audio (loopback) to its own track
     dir: PathBuf,
 }
 
 #[derive(Default)]
-struct RecShared { stop: AtomicBool, paused: Arc<AtomicBool>, written: AtomicU64, dups: AtomicU64, error: Mutex<Option<String>> }
+struct RecShared { stop: AtomicBool, paused: Arc<PauseClock>, written: AtomicU64, dups: AtomicU64, error: Mutex<Option<String>> }
 
 enum WMsg { Frame(u64, Vec<u8>), Dup(u64), Done(u64) }
 
 struct Recorder {
     pub sh: Arc<RecShared>, cap: Option<JoinHandle<()>>, workers: Vec<JoinHandle<()>>,
-    writer: Option<JoinHandle<Res<u64>>>, mic: Option<MicCapture>, pub fps: u32, pub dims: (u32, u32),
-    pub dir: PathBuf, pub mic_error: Option<String>, pub shm: bool,
+    writer: Option<JoinHandle<Res<u64>>>, mic: Option<AudioCapture>, sys: Option<AudioCapture>,
+    pub fps: u32, pub dims: (u32, u32), pub dir: PathBuf, pub mic_error: Option<String>, pub sys_error: Option<String>, pub shm: bool,
 }
 
 impl Recorder {
@@ -643,7 +932,7 @@ impl Recorder {
             let mut fails = 0u32;
             while !sh_c.stop.load(Relaxed) {
                 let now = Instant::now();
-                if sh_c.paused.load(Relaxed) { last = now; thread::sleep(Duration::from_millis(10)); continue; }
+                if sh_c.paused.is() { last = now; thread::sleep(Duration::from_millis(10)); continue; }
                 active += now - last;
                 last = now;
                 let due = (active.as_secs_f64() * fps as f64).floor() as u64 + 1;
@@ -793,21 +1082,23 @@ impl Recorder {
             r
         }).map_err(es)?;
 
-        // ---- mic (main thread: cpal streams may be !Send)
-        let mut mic_error = None;
-        let mic = match &cfg.mic {
-            None => None,
-            Some(name) => match MicCapture::start(name.as_deref(), sh.paused.clone()) {
-                Ok(m) => Some(m),
-                Err(e) => { mic_error = Some(e); None }
-            },
+        // ---- audio (main thread: cpal streams may be !Send). Failures degrade to video-only
+        // for that source and are reported, never abort the recording.
+        let open = |want: bool, src: AudioSrc| -> (Option<AudioCapture>, Option<String>) {
+            if !want { return (None, None); }
+            match AudioCapture::start(src, sh.paused.clone()) { Ok(c) => (Some(c), None), Err(e) => (None, Some(e)) }
         };
+        let (mic, mic_error) = open(cfg.mic.is_some(), AudioSrc::Mic(cfg.mic.as_ref().and_then(|m| m.as_deref())));
+        let (sys, sys_error) = open(cfg.sys, AudioSrc::System);
         let _ = go_tx.send(true);
-        Ok(Recorder { sh, cap: Some(cap), workers, writer: Some(writer), mic, fps: cfg.fps, dims, dir: cfg.dir, mic_error, shm })
+        Ok(Recorder { sh, cap: Some(cap), workers, writer: Some(writer), mic, sys, fps: cfg.fps, dims, dir: cfg.dir,
+                      mic_error, sys_error, shm })
     }
 
-    /// Stop everything, join threads, return (frame count, mic track 48k mono fitted to video).
-    fn finish(mut self) -> Res<(u32, Option<Vec<i16>>)> {
+    /// Stop everything, join threads, return (frame count, mic, system audio); audio is
+    /// (channels, 48 kHz interleaved samples) fitted exactly to the video length.
+    fn finish(mut self) -> Res<(u32, Option<(u16, Vec<i16>)>, Option<(u16, Vec<i16>)>)> {
+        let stop_at = self.sh.paused.active(Instant::now());
         self.sh.stop.store(true, Relaxed);
         if let Some(c) = self.cap.take() { let _ = c.join(); }
         for w in self.workers.drain(..) { let _ = w.join(); }
@@ -815,8 +1106,11 @@ impl Recorder {
             .unwrap_or(Err("no writer".into()))?;
         let frames = u32::try_from(frames).map_err(|_| "recording too long")?;
         let spf = (AR / self.fps) as usize;
-        let mic = self.mic.take().map(|m| fit_len(m.finish(), 1, frames as usize * spf));
-        Ok((frames, mic))
+        let target = frames as usize * spf;
+        let fit = |c: AudioCapture| { let (ch, v) = c.finish(Some(stop_at)); (ch, fit_len(v, ch as usize, target)) };
+        let mic = self.mic.take().map(fit);
+        let sys = self.sys.take().map(fit);
+        Ok((frames, mic, sys))
     }
 }
 
@@ -1147,10 +1441,20 @@ impl PlayShared {
     fn seek_to(&self, p: u64) { self.pos.store(p, Relaxed); self.seek.store(p, Release); }
 }
 
+/// Preview playback buffer. cpal's PulseAudio backend with `BufferSize::Default` gets a
+/// ~2 s server buffer, so preview audio lagged the picture by ~2 s (fatal for syncing
+/// narration). A fixed 20 ms period (40 ms double buffer) keeps it tight; other backends'
+/// defaults are already short. Remaining device latency is compensated in `build_out`.
+fn playback_buffer() -> cpal::BufferSize {
+    #[cfg(target_os = "linux")]
+    if cpal::default_host().id() == cpal::HostId::PulseAudio { return cpal::BufferSize::Fixed(AR / 50); }
+    cpal::BufferSize::Default
+}
+
 fn start_output(ps: Arc<PlayShared>) -> Res<cpal::Stream> {
     let host = cpal::default_host();
     let dev = host.default_output_device().ok_or("no audio output device")?;
-    let want = cpal::StreamConfig { channels: 2, sample_rate: AR, buffer_size: cpal::BufferSize::Default };
+    let want = cpal::StreamConfig { channels: 2, sample_rate: AR, buffer_size: playback_buffer() };
     let s = match build_out::<f32>(&dev, &want, ps.clone()) {
         Ok(s) => s,
         Err(_) => {
@@ -1175,9 +1479,11 @@ where T: SizedSample + FromSample<f32> + Send + 'static {
     let step = AR as f64 / cfg.sample_rate.max(1) as f64;
     let mut frac = 0f64;
     let mut pos: u64 = 0;
-    dev.build_output_stream::<T, _, _>(*cfg, move |data: &mut [T], _| {
+    let mut start: u64 = 0;
+    let cfg_rate = cfg.sample_rate.max(1) as f64;
+    dev.build_output_stream::<T, _, _>(*cfg, move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
         let sk = ps.seek.swap(NO_SEEK, Acquire);
-        if sk != NO_SEEK { pos = sk; frac = 0.0; }
+        if sk != NO_SEEK { pos = sk; frac = 0.0; start = sk; } // `start`: never report before the seek point
         let silent = |d: &mut [T]| d.iter_mut().for_each(|x| *x = T::EQUILIBRIUM);
         if !ps.playing.load(Relaxed) { silent(data); return; }
         // try_lock: never block the real-time thread; a busy lock costs one silent buffer.
@@ -1201,7 +1507,13 @@ where T: SizedSample + FromSample<f32> + Send + 'static {
             pos += adv as u64;
             frac -= adv;
         }
-        ps.pos.store(pos, Relaxed);
+        // Publish the position being *heard* now, not the one just queued: back off by the
+        // time until this buffer's last frame plays, so the picture matches the sound.
+        let ts = info.timestamp();
+        let lead = ts.playback.saturating_duration_since(ts.callback).as_secs_f64()
+            + (data.len() / ch) as f64 / cfg_rate;
+        let heard = pos.saturating_sub((lead.min(5.0) * AR as f64) as u64);
+        ps.pos.store(heard.max(start.min(pos)), Relaxed);
     }, |e| eprintln!("[out] stream error: {e}"), None).map_err(es)
 }
 
@@ -1420,7 +1732,7 @@ impl Decoder {
 // Application state
 // =====================================================================================
 
-struct NarrRec { mic: MicCapture, track: usize, start: u32, end: u32, clear: bool }
+struct NarrRec { mic: AudioCapture, track: usize, start: u32, end: u32, clear: bool }
 
 struct Ctl { win: Window, lbl: Frame, pause: Button }
 
@@ -1557,8 +1869,7 @@ impl App {
         };
         let (a, b) = self.sel.unwrap_or((self.playhead, self.total()));
         if b <= a + 1 { return Err("Move the playhead before the end, or select a range to re-record".into()); }
-        let paused = Arc::new(AtomicBool::new(false));
-        let m = MicCapture::start(mic.as_deref(), paused)?;
+        let m = AudioCapture::start(AudioSrc::Mic(mic.as_deref()), Arc::new(PauseClock::default()))?;
         self.push_undo();
         self.narr = Some(NarrRec { mic: m, track: ti, start: a, end: b, clear: self.sel.is_some() });
         self.sync_mix(); // excludes the track being re-recorded from playback
@@ -1572,7 +1883,7 @@ impl App {
         let Some(n) = self.narr.take() else { return };
         self.set_playing(false);
         let spf = self.spf();
-        let mut s = n.mic.finish();
+        let (_, mut s) = n.mic.finish(None); // mic capture is always mono
         let maxlen = (n.end - n.start) as usize * spf;
         s.truncate(maxlen);
         let secs = s.len() as f64 / AR as f64;
@@ -1604,7 +1915,7 @@ impl App {
 #[derive(Clone)]
 struct Ui {
     win: Window, rec_full: Button, rec_region: Button, fps: Choice, quality: Choice, half: CheckButton, cursor: CheckButton,
-    mic: Choice, open: Button, save: Button, exp_mkv: Button, exp_mov: Button, exp_mp4: Button, exp_wav: Button,
+    mic: Choice, sys: CheckButton, open: Button, save: Button, exp_mkv: Button, exp_mov: Button, exp_mp4: Button, exp_wav: Button,
     preview: Frame, play: Button, time: Frame, cut: Button, ifreeze: Button, fsecs: Spinner, freeze_sel: Button,
     undo: Button, redo: Button, narr: Button, fitz: Button,
     track: Choice, mute: Button, gain: HorNiceSlider, shl: Button, shr: Button, newt: Button, import: Button, replace: Button, remove: Button,
@@ -1902,7 +2213,7 @@ fn begin_recording(app: &Shared, ui: &Ui, region: Rect) {
     let (quality, s444) = [(60u8, false), (80, false), (92, true)][qi.min(2)];
     let cfg = RecConfig {
         region, fps: FPS_CHOICES[ui.fps.value().clamp(0, FPS_CHOICES.len() as i32 - 1) as usize], quality, s444,
-        half: ui.half.is_checked(), cursor: ui.cursor.is_checked(), mic, dir: rec_dir(),
+        half: ui.half.is_checked(), cursor: ui.cursor.is_checked(), mic, sys: ui.sys.is_checked(), dir: rec_dir(),
     };
     {
         let mut a = app.borrow_mut();
@@ -1939,7 +2250,7 @@ fn begin_recording(app: &Shared, ui: &Ui, region: Rect) {
         let a3 = app.clone();
         pause.set_callback(move |b| {
             let a = a3.borrow();
-            if let Some(r) = &a.rec { let p = !r.sh.paused.load(Relaxed); r.sh.paused.store(p, Relaxed); b.set_label(if p { "▶ Resume" } else { "|| Pause" }); }
+            if let Some(r) = &a.rec { let p = r.sh.paused.toggle(); b.set_label(if p { "▶ Resume" } else { "|| Pause" }); }
         });
         let (a4, u4) = (app.clone(), ui.clone());
         win.set_callback(move |_| if app::event() == Event::Close { stop_recording(&a4, &u4) });
@@ -1969,7 +2280,10 @@ fn begin_recording(app: &Shared, ui: &Ui, region: Rect) {
         s.rec_pending = false;
         match r {
             Ok(r) => {
-                if let Some(e) = &r.mic_error { s.status = format!("Mic unavailable ({e}); recording video only"); }
+                let mut w = vec![];
+                if let Some(e) = &r.mic_error { w.push(format!("mic unavailable ({e})")); }
+                if let Some(e) = &r.sys_error { w.push(format!("system audio unavailable ({e})")); }
+                if !w.is_empty() { s.status = format!("{} - recording without it", w.join("; ")); }
                 s.rec = Some(r);
             }
             Err(e) => {
@@ -1994,14 +2308,18 @@ fn stop_recording(app: &Shared, ui: &Ui) {
     app::flush();
     let Some(rec) = rec else { if pending { abort_ctl(app, ui); } return };
     let (fps, dims, dir) = (rec.fps, rec.dims, rec.dir.clone());
-    let err = rec.sh.error.lock().unwrap().clone().or_else(|| rec.mic_error.clone().map(|e| format!("mic unavailable: {e}")));
+    let err = rec.sh.error.lock().unwrap().clone()
+        .or_else(|| rec.mic_error.clone().map(|e| format!("mic unavailable: {e}")))
+        .or_else(|| rec.sys_error.clone().map(|e| format!("system audio unavailable: {e}")));
     let dropped = rec.sh.dups.load(Relaxed);
     let res = rec.finish();
     abort_ctl(app, ui);
-    match res.and_then(|(frames, mic)| {
+    match res.and_then(|(frames, mic, sys)| {
         let src = Arc::new(Source::open(&dir, dims.0, dims.1, fps)?);
         let mut tracks = Vec::new();
-        if let Some(m) = mic { tracks.push(Track { name: "Mic".into(), ch: 1, data: Arc::new(m), gain: 1.0, muted: false }); }
+        // Separate tracks: mic and system audio can be muted/replaced/re-recorded independently.
+        if let Some((ch, m)) = mic { tracks.push(Track { name: "Mic".into(), ch, data: Arc::new(m), gain: 1.0, muted: false }); }
+        if let Some((ch, v)) = sys { tracks.push(Track { name: "System".into(), ch, data: Arc::new(v), gain: 1.0, muted: false }); }
         let mut p = Project { edit: Edit { segs: vec![Seg::Src { start: 0, len: src.count() }], tracks }, src, undo: vec![], redo: vec![], dirty: true };
         p.save()?;
         Ok((p, frames))
@@ -2081,7 +2399,7 @@ fn tick(app: &Shared, ui: &Ui) {
     let mut need = false;
     // Recording status
     if a.rec.is_some() {
-        let (written, dups, paused, err, fps) = { let r = a.rec.as_ref().unwrap(); (r.sh.written.load(Relaxed), r.sh.dups.load(Relaxed), r.sh.paused.load(Relaxed), r.sh.stop.load(Relaxed), r.fps) };
+        let (written, dups, paused, err, fps) = { let r = a.rec.as_ref().unwrap(); (r.sh.written.load(Relaxed), r.sh.dups.load(Relaxed), r.sh.paused.is(), r.sh.stop.load(Relaxed), r.fps) };
         if let Some(c) = &mut a.ctl {
             let l = if dups > 0 { format!("{} REC {}  ({dups} dropped)", if paused { "||" } else { "●" }, fmt_time(written as u32, fps)) }
                 else { format!("{} REC {}", if paused { "||" } else { "●" }, fmt_time(written as u32, fps)) };
@@ -2166,7 +2484,10 @@ fn build_ui(app: &Shared) -> Ui {
     mic.add_choice("Mic: default");
     for n in &app.borrow().mics { mic.add_choice(&format!("Mic: {}", esc(&n.replace(['/', '|', '&', '_', '\\'], " ")))); }
     mic.set_value(1);
-    r1.fixed(&rec_full, 130); r1.fixed(&rec_region, 130); r1.fixed(&fps, 80); r1.fixed(&quality, 180); r1.fixed(&half, 80); r1.fixed(&cursor, 70);
+    let mut sys = CheckButton::default().with_label("System audio");
+    sys.set_tooltip("Also record what the computer plays (videos, apps) to its own \"System\" track.\n\
+Linux: needs PulseAudio or PipeWire. Use headphones to keep speaker sound out of the mic.");
+    r1.fixed(&rec_full, 130); r1.fixed(&rec_region, 130); r1.fixed(&fps, 80); r1.fixed(&quality, 180); r1.fixed(&half, 80); r1.fixed(&cursor, 70); r1.fixed(&sys, 115);
     r1.end();
     col.fixed(&r1, 30);
 
@@ -2233,7 +2554,7 @@ fn build_ui(app: &Shared) -> Ui {
     col.end();
     win.end();
     win.make_resizable(true);
-    let ui = Ui { win, rec_full, rec_region, fps, quality, half, cursor, mic, open, save, exp_mkv, exp_mov, exp_mp4, exp_wav,
+    let ui = Ui { win, rec_full, rec_region, fps, quality, half, cursor, mic, sys, open, save, exp_mkv, exp_mov, exp_mp4, exp_wav,
         preview, play, time, cut, ifreeze, fsecs, freeze_sel, undo, redo, narr, fitz, track, mute, gain, shl, shr, newt, import,
         replace, remove, timeline, status };
     // Buttons should not steal Space/Enter (used as shortcuts).
@@ -2516,18 +2837,19 @@ fn wire(app: &Shared, ui: &Ui) {
 // Self-test (headless-capable): capture N seconds, edit, export, verify
 // =====================================================================================
 
-fn selftest(out: &Path, secs: f64, full: bool) -> Res<()> {
+fn selftest(out: &Path, secs: f64, full: bool, sys: bool) -> Res<()> {
     let vs = cap::virtual_screen()?;
     let region = if full { Rect { w: vs.w & !1, h: vs.h & !1, ..vs } } else { Rect { x: 0, y: 0, w: vs.w.min(640) & !1, h: vs.h.min(360) & !1 } };
     let dir = out.join("st_rec");
     let _ = std::fs::remove_dir_all(&dir);
-    let rec = Recorder::start(RecConfig { region, fps: 30, quality: 80, s444: false, half: false, cursor: true, mic: None, dir: dir.clone() })?;
+    let rec = Recorder::start(RecConfig { region, fps: 30, quality: 80, s444: false, half: false, cursor: true, mic: None, sys, dir: dir.clone() })?;
     println!("capture: {}x{} shm={}", rec.dims.0, rec.dims.1, rec.shm);
+    if let Some(e) = &rec.sys_error { return Err(format!("system audio: {e}")); }
     let t0 = Instant::now();
     thread::sleep(Duration::from_secs_f64(secs));
     let dups = rec.sh.dups.load(Relaxed);
     let (dims, fps) = (rec.dims, rec.fps);
-    let (frames, _) = rec.finish()?;
+    let (frames, _, sys_trk) = rec.finish()?;
     println!("recorded {frames} frames in {:.2}s (dups {dups})", t0.elapsed().as_secs_f64());
     let src = Arc::new(Source::open(&dir, dims.0, dims.1, fps)?);
     let spf = src.spf();
@@ -2535,6 +2857,16 @@ fn selftest(out: &Path, secs: f64, full: bool) -> Res<()> {
     // synthetic 440 Hz tone track + edits
     let tone: Vec<i16> = (0..n as usize * spf).map(|i| ((i as f32 * 440.0 * std::f32::consts::TAU / AR as f32).sin() * 8000.0) as i16).collect();
     let mut e = Edit { segs: vec![Seg::Src { start: 0, len: n }], tracks: vec![Track { name: "Tone".into(), ch: 1, data: Arc::new(tone), gain: 1.0, muted: false }] };
+    if let Some((ch, v)) = sys_trk {
+        // loopback track must be fitted exactly to the video and carry real signal
+        assert_eq!(v.len(), n as usize * spf * ch as usize, "system track length != video length");
+        let peak = v.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0);
+        let rms = (v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt();
+        write_wav(&out.join("selftest_system.wav"), ch, AR, &v)?;
+        println!("system audio: {ch} ch, {:.2}s, peak {peak}, rms {rms:.0}", v.len() as f64 / ch as f64 / AR as f64);
+        if peak < 300 { return Err("system audio track is silent (was anything playing?)".into()); }
+        e.tracks.push(Track { name: "System".into(), ch, data: Arc::new(v), gain: 1.0, muted: false });
+    }
     e.cut(10, 20, spf);
     assert_eq!(e.total(), n - 10);
     assert_eq!(e.tracks[0].frames(), (n as usize - 10) * spf);
@@ -2577,7 +2909,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") { println!("{FILE_TAG} ({APP_NAME} {VERSION})"); return; }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{APP_NAME} {VERSION}\nUsage: screenreel [project_dir] | --selftest <outdir> [seconds] [full] | --probe-audio <file> | --version");
+        println!("{APP_NAME} {VERSION}\nUsage: screenreel [project_dir] | --selftest <outdir> [seconds] [full] [sys] | --probe-audio <file> | --version");
         return;
     }
     if let Some(f) = args.iter().position(|a| a == "--probe-audio").and_then(|i| args.get(i + 1)) {
@@ -2591,8 +2923,10 @@ fn main() {
         let out = PathBuf::from(args.get(i + 1).cloned().unwrap_or_else(|| ".".into()));
         let secs = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(3.0);
         let _ = std::fs::create_dir_all(&out);
-        let full = args.get(i + 3).map(|s| s == "full").unwrap_or(false);
-        match selftest(&out, secs, full) { Ok(()) => return, Err(e) => { eprintln!("selftest FAILED: {e}"); std::process::exit(1); } }
+        let rest = &args[(i + 3).min(args.len())..];
+        let full = rest.iter().any(|s| s == "full");
+        let sys = rest.iter().any(|s| s == "sys");
+        match selftest(&out, secs, full, sys) { Ok(()) => return, Err(e) => { eprintln!("selftest FAILED: {e}"); std::process::exit(1); } }
     }
 
     let a = app::App::default().with_scheme(app::Scheme::Gtk);
