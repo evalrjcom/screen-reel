@@ -1,0 +1,35 @@
+# ScreenReel v1.0.0 — lightweight screen recorder/editor (Rust + FLTK)
+# Single-file source: screenreel_v1.0.0.rs  |  build helper: build_screenreel_v1.0.0.sh
+[package]
+name = "screenreel"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.79"          # std::path::absolute
+description = "Lightweight ScreenPal-style screen recorder with lossless (no re-encode) editing"
+license = "MIT"
+
+[[bin]]
+name = "screenreel"
+path = "screenreel_v1.0.0.rs"
+
+[dependencies]
+fltk = { version = "1.5", features = ["no-pango"] }          # FLTK statically linked; no pango/cairo
+jpeg-encoder = { version = "0.7", features = ["simd"] }      # AVX2 MJPEG encode at capture time
+zune-jpeg = "0.5"                                            # fast safe JPEG decode for preview
+zune-core = "0.5"
+cpal = { version = "0.18", features = ["pulseaudio"] }       # pure-Rust Pulse/PipeWire client first, ALSA fallback
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "flac", "wav", "pcm", "vorbis", "ogg", "mkv"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.14", features = ["shm", "xfixes", "allow-unsafe-code"] }   # pure-Rust X11 (no libxcb needed)
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
