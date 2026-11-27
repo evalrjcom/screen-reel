@@ -87,9 +87,12 @@ alpine_inner() {
     done
     export CC_x86_64_unknown_linux_musl=gcc CXX_x86_64_unknown_linux_musl=g++
     RF="-C target-feature=+crt-static"
-    for l in xcb Xau Xdmcp fontconfig freetype png16 z bz2 brotlidec brotlicommon expat stdc++; do RF="$RF -C link-arg=-l$l"; done
-    # static archives need libc again after them (xcb uses htonl etc.)
-    RF="$RF -C link-arg=-lc"
+    # Static archives are order-sensitive: resolve the whole X/font/runtime stack as one
+    # linker group (Xft->Xrender->Xext->X11->xcb..., libgcc for __popcountdi2, libc last).
+    RF="$RF -C link-arg=-Wl,--start-group"
+    for l in Xft Xrender Xcursor Xfixes Xinerama Xext X11 xcb Xau Xdmcp fontconfig freetype png16 z bz2 \
+             brotlidec brotlicommon expat stdc++ gcc c; do RF="$RF -C link-arg=-l$l"; done
+    RF="$RF -C link-arg=-Wl,--end-group"
     export RUSTFLAGS="$RF" PKG_CONFIG_PATH=/opt/alsa-static/lib/pkgconfig PKG_CONFIG_ALL_STATIC=1
     cargo build --release --target x86_64-unknown-linux-musl --manifest-path /src/Cargo.toml --target-dir /src/target-musl
     out="/src/dist/${TAG}-linux-x86_64-static"
