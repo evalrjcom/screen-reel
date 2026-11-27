@@ -78,7 +78,7 @@ alpine_inner() {
     # Hide shared-object dev symlinks so every -lX resolves to the .a archive.
     # (fltk-sys emits dylib=X11 etc.; with only .a present the result is fully static.)
     for l in X11 Xext Xinerama Xcursor Xrender Xfixes Xft fontconfig xcb Xau Xdmcp freetype png16 png z bz2 \
-             brotlidec brotlicommon expat stdc++ asound; do rm -f "/usr/lib/lib$l.so"; done
+             brotlidec brotlicommon expat stdc++ asound; do rm -f "/usr/lib/lib$l.so" "/lib/lib$l.so"; done
     command -v cargo >/dev/null 2>&1 || { rustup-init -y --profile minimal >/dev/null; . "$HOME/.cargo/env"; }
     # fltk-sys hard-codes musl-gcc/musl-g++ for *-linux-musl targets; on Alpine the
     # native toolchain already targets musl, so alias those names to it.
