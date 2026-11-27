@@ -1,12 +1,12 @@
-# ScreenReel v1.1.0 — User & Developer Guide
+# ScreenReel v1.2.0 — User & Developer Guide
 
 ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written in Rust and FLTK. It builds as a single binary for Linux and Windows.
 
 | | |
 |---|---|
-| Source | `screenreel_v1.1.0.rs` (single file, about 3,000 lines) |
-| Build helper | `build_screenreel_v1.1.0.sh` |
-| CI | `.github/workflows/screenreel_v1.1.0.yml` |
+| Source | `screenreel_v1.2.0.rs` (single file, about 3,600 lines) |
+| Build helper | `build_screenreel_v1.2.0.sh` |
+| CI | `.github/workflows/screenreel_v1.2.0.yml` |
 | Binary size | about 4.1–4.7 MB (Linux, stripped, LTO) |
 
 ---
@@ -18,14 +18,17 @@ ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written 
 | Record the full screen or a region | X11 MIT-SHM capture on Linux (falls back to XGetImage). GDI BitBlt on Windows. The cursor is composited into the video. |
 | Microphone | Records directly into a **Mic** track that is sample-aligned to the video. |
 | System audio | Optional. Records what the computer is playing (a video, a browser tab, an app) into its own stereo **System** track, alongside the mic. Mute, swap, cut or re-level each track on its own. |
-| Visual timeline | Ruler, video lane (blue = recorded, orange = FREEZE) and one waveform lane per audio track. Includes selection, playhead, zoom and scroll. |
+| Visual timeline | Ruler, video lane (blue = recorded, orange = FREEZE, green = sped up, labelled "2×" etc.) and one waveform lane per audio track. Includes selection, playhead, zoom and scroll. Dead-air candidates show in red. |
 | Cut | Ripple-deletes the selection from the video and from every audio track. |
 | Insert freeze | Holds the frame under the playhead for N seconds. Tracks get matching silence, which you can narrate over. |
 | Freeze selection | Holds the first frame of the selection across the whole range. Audio keeps playing. |
+| Speed up selection | Plays the selected range 1.25× to 16× faster. Video skips frames losslessly. Audio is time-compressed with its pitch kept (WSOLA), or muted if you prefer. |
+| Find / remove dead air | Finds stretches where every audible track is silent **and** the picture doesn't change, highlights them, and cuts them all in one undoable step. |
+| Compact project | Rewrites the recording so it keeps only the frames your edit uses. Cut footage and dead air stop taking disk space. |
 | Narration re-record | Plays the video and records the mic over the selection (or from the playhead to the end), replacing that part of the track. |
 | Audio tracks | Add, swap, remove, mute, set gain (0–200 %) and nudge by ±1 frame. Imports WAV, MP3, FLAC, OGG, M4A/AAC and the audio from MP4, MKV or MOV files. |
 | Export | **MKV**: instant, no video re-encode. **MOV**: lossless remux through ffmpeg. **MP4**: H.264 re-encode through ffmpeg. **WAV**: the audio mix. |
-| Projects | Saved as a folder you can reopen. Undo/redo keeps 64 steps. |
+| Projects | **New**, **Open…** and **Save**. Saved as a folder you can reopen. Undo/redo keeps 64 steps. |
 
 ### Why edits and exports never re-encode the video
 
@@ -42,7 +45,7 @@ Audio is 48 kHz 16-bit PCM throughout. Mixing tracks for export is plain sample 
 
 ## 2. Quick start
 
-1. Run the binary (`screenreel_v1.1.0-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.1.0-windows-x86_64.exe`).
+1. Run the binary (`screenreel_v1.2.0-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.2.0-windows-x86_64.exe`).
 2. Pick an fps, a quality and a microphone in the top bar. Tick **System audio** to also record what the computer plays.
 3. Click **● Record Screen**, or **● Record Region** and drag a rectangle (Esc or right-click cancels).
 4. After a 3-2-1 countdown, a small **REC** bar shows elapsed time with **|| Pause** and **■ Stop**.
@@ -102,7 +105,9 @@ These work when the timeline or window has focus.
 | Key | Action |
 |---|---|
 | Space | Play / pause (also stops a narration take) |
-| Del / Backspace | Cut the selection |
+| Space Space (double tap within 0.4 s) | Back to 0:00. If it was playing, it keeps playing from the start; if paused, it stays paused |
+| Del / Backspace / **Ctrl+X** | Cut the selection |
+| **Ctrl+N** | New project (asks to save unsaved changes first) |
 | F | Insert a freeze at the playhead (length = spinner value) |
 | ← / → | Step one frame |
 | Home / End | Jump to start / end |
@@ -118,6 +123,38 @@ These work when the timeline or window has focus.
 4. The take stops at the end of the range, or when you click again or press Space. With a selection, any part of the range you didn't record over becomes silence, so no old take is left behind.
 
 To sync narration, **◀ 1f / 1f ▶** shifts the selected track by one video frame.
+
+### Speeding up a range
+
+1. Drag-select the range on the timeline.
+2. Pick a speed in **Speed:** (1.25×, 1.5×, 2×, 3×, 4×, 8×, 16×).
+3. Optionally tick **Mute sped-up audio**. Otherwise the audio is compressed to the new length with its pitch kept, so speech still sounds like speech, just faster.
+4. Click **» Speed up selection**. The range turns green with its speed label, and the selection now covers the shorter range.
+
+Speeding up an already sped-up range multiplies the speeds, up to 64×. Freeze segments inside the range simply get shorter. Undo with Ctrl+Z.
+
+How it works: a sped-up range is a `Fast` segment that plays every *n*th recorded frame. No video is re-encoded, and MKV export stays instant.
+
+### Removing dead air
+
+1. Click **Find dead air…** and enter the minimum length to remove (default 2 s, minimum 0.3 s).
+2. The scan runs in the background, with progress on the status line. Matching regions turn red.
+3. Click **Remove dead air (N)** to cut them all as one undo step.
+
+A frame counts as dead when:
+- **every unmuted track is silent**: its peak is below −45 dBFS, after gain;
+- **and the picture doesn't change**: fewer than 0.05 % of pixels (sampled on a 4-pixel grid) change by more than 40/255 compared with the first frame of the still stretch. Moving the mouse alone doesn't count as a change, but typing or scrolling does.
+
+About 0.2 s is left at each edge of every region, so cuts never feel abrupt. Any edit, mute or gain change clears the results, so a stale range can never be cut.
+
+### Freeing disk space: Compact project
+
+Cutting, removing dead air and speeding up only change the edit list. The original recording stays on disk, which is what makes undo instant. When you're done, **Compact project…** reclaims the space:
+
+- It writes `frames_cN.mjpg` / `.idx` holding each frame the edit uses exactly once. Holds and speed-ups become repeated or skipped 12-byte index entries.
+- It points `project.txt` at the new files and deletes the old ones.
+
+It is lossless: the JPEG bytes are copied. The edit is flattened to one blue segment and undo history is cleared, so the app asks you to confirm first. New files are fully written and synced before the project switches to them.
 
 ### Swapping and adding audio
 
@@ -135,9 +172,23 @@ To sync narration, **◀ 1f / 1f ▶** shifts the selected track by one video fr
 | Button | Output | Re-encode? | Needs |
 |---|---|---|---|
 | Export MKV (instant) | Matroska with `V_MJPEG` + `A_PCM/INT/LIT` 48 kHz stereo, 1-second clusters and cues (seekable) | **None** | nothing |
-| Export MOV (lossless) | QuickTime container, same streams, via `ffmpeg -c copy` | **None** | `ffmpeg` on PATH |
-| Export MP4 (H.264) | H.264 CRF 18 + AAC 192k, faststart, for upload sites | Yes (labelled) | `ffmpeg` on PATH |
+| Export MOV (lossless) | QuickTime container, same streams, via `ffmpeg -c copy` | **None** | ffmpeg |
+| Export MP4 (H.264) | H.264 CRF 18 + AAC 192k, faststart, for upload sites | Yes (labelled) | ffmpeg |
 | Export WAV mix | 48 kHz stereo 16-bit mix of all unmuted tracks | n/a | nothing |
+
+### Getting ffmpeg for MOV/MP4
+
+In v1.1.0, MOV and MP4 were greyed out whenever `ffmpeg` wasn't on the PATH of the running app. That was common on Windows: a winget or Scoop install, or an unzipped ffmpeg, isn't on PATH for apps started before it.
+
+Since v1.2.0, the buttons are always clickable. ScreenReel looks for ffmpeg in this order:
+
+1. the `SCREENREEL_FFMPEG` environment variable (full path to the executable)
+2. a location you picked earlier with **Locate ffmpeg…** (stored in `%APPDATA%\ScreenReel\ffmpeg_path` or `~/.config/screenreel/ffmpeg_path`)
+3. the folder ScreenReel itself is in: just drop `ffmpeg.exe` next to `ScreenReel.exe`
+4. `PATH`
+5. Windows: `%LOCALAPPDATA%\Microsoft\WinGet\Links`, `%USERPROFILE%\scoop\shims`, `%ProgramData%\chocolatey\bin`, `Program Files\ffmpeg\bin`, `C:\ffmpeg\bin`. Linux: `/usr/bin`, `/usr/local/bin`, `/snap/bin`
+
+If none of these is found, clicking MOV or MP4 explains how to install ffmpeg (`winget install Gyan.FFmpeg` on Windows) and offers **Locate ffmpeg…** or **Search again**. Each candidate is checked by running `ffmpeg -version`. On Windows it runs without a console window.
 
 MKV plays in VLC, mpv, ffplay, Kdenlive, Shotcut, DaVinci Resolve and OBS. Use MP4 when a website needs H.264. Exports write to `*.part` and rename on success, so an interrupted export never leaves a truncated file under the final name.
 
@@ -151,7 +202,11 @@ Every project is a folder:
 rec_20261125_193739/
   frames.mjpg     concatenated JPEG frames (append-only, never modified by edits)
   frames.idx      12 bytes per frame: u64 offset + u32 length (little-endian)
-  project.txt     key=value: version, width, height, fps, seg=S|H ..., track=name|gain|muted|file
+  project.txt     key=value: version, width, height, fps, media, seg=..., track=name|gain|muted|file
+                    seg=S start len           recorded frames start..start+len
+                    seg=H frame len           hold one frame (freeze)
+                    seg=F start len sp ph     sped up: output k shows start + (ph+k)*sp/100 (sp = speed×100)
+                    media=frames              media pair name (frames_cN after Compact project)
   track_N.wav     48 kHz PCM per track (mono or stereo)
 ```
 
@@ -188,14 +243,14 @@ Rust, FLTK, the JPEG code and ALSA are all linked in. Only the system X11, fontc
 ```sh
 sudo apt install cmake ninja-build g++ pkg-config autoconf automake libtool \
   libx11-dev libxext-dev libxinerama-dev libxcursor-dev libxrender-dev libxfixes-dev libxft-dev libfontconfig1-dev
-./build_screenreel_v1.1.0.sh native            # -> dist/screenreel_v1.1.0-linux-x86_64-glibc
-./build_screenreel_v1.1.0.sh selftest dist/screenreel_v1.1.0-linux-x86_64-glibc
+./build_screenreel_v1.2.0.sh native            # -> dist/screenreel_v1.2.0-linux-x86_64-glibc
+./build_screenreel_v1.2.0.sh selftest dist/screenreel_v1.2.0-linux-x86_64-glibc
 ```
 
 ### Fully static Linux (musl)
 
 ```sh
-./build_screenreel_v1.1.0.sh linux-static      # needs podman or docker; builds inside alpine:3.20
+./build_screenreel_v1.2.0.sh linux-static      # needs podman or docker; builds inside alpine:3.20
 ```
 
 The script:
@@ -209,9 +264,9 @@ The script:
 | Method | Command |
 |---|---|
 | Native (MSVC) | `set RUSTFLAGS=-C target-feature=+crt-static` then `cargo build --release`. Static CRT, so no VC++ redistributable is needed. |
-| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.1.0.sh windows` |
+| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.2.0.sh windows` |
 
-CI (`.github/workflows/screenreel_v1.1.0.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
+CI (`.github/workflows/screenreel_v1.2.0.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
 
 ### Command line
 
@@ -245,7 +300,8 @@ cpal output stream ─ real-time mixer (try_lock, never blocks); playhead = the 
 export thread ─ Matroska muxer, cancellable, progress in permille
 ```
 
-**Edit model.** The edit is a `Vec<Seg>`, where `Seg` is `Src{start,len}` or `Hold{frame,len}`, plus `Vec<Track{Arc<Vec<i16>>}>`.
+**Edit model.** The edit is a `Vec<Seg>`, where `Seg` is `Src{start,len}`, `Hold{frame,len}` or `Fast{start,len,sp,ph}`, plus `Vec<Track{Arc<Vec<i16>>}>`.
+- `Fast` maps output frame *k* to `start + (ph+k)·sp/100`. Splitting it at *a* gives `ph+a` to the right half, so cuts inside a sped-up range keep the exact frame mapping, and `normalize` merges the halves back.
 - Snapshots for undo are cheap: they clone `Arc`s.
 - Every operation is ripple-consistent between video and audio, because `samples_per_frame = 48000/fps` is an exact integer.
 
@@ -293,16 +349,52 @@ export thread ─ Matroska muxer, cancellable, progress in permille
 - The handshake has a 3 s timeout.
 - Errors from either audio source never abort a recording. The source is dropped and the reason shown.
 
+### Audit notes (v1.2.0)
+
+**Root cause: MOV/MP4 unavailable on Windows**
+- `ffmpeg_available()` only spawned `ffmpeg` from PATH, once, at startup. The buttons were then disabled for the whole session.
+- Fixed with multi-location discovery, a remembered user choice and a dialog that explains what to do.
+- ffmpeg runs from an absolute path with an argv array (no shell) and with `CREATE_NO_WINDOW` on Windows.
+
+**Correctness**
+- `Fast` frame math uses `u64` (`(ph+k)·sp` can't overflow). At load, every segment's highest source frame (`max_src`) is checked against the recording, so a hostile `project.txt` can't index outside `frames.idx`.
+- Speeds are limited to 1.01×–64×, the phase to `u32::MAX/2`, the total length to `u32::MAX/2`, and the file to 2²⁰ segments.
+- The WSOLA output length is exact (`frames × 48000/fps`), so audio and video stay in lock-step after a speed-up. This is asserted in `--selftest`.
+- Dead-air results are tagged with an edit generation. Any edit, undo, mute or gain change makes them stale, and **Remove dead air** refuses stale ranges.
+- Ranges are cut last-first, so earlier ranges keep their indices.
+- **Open** had no unsaved-changes check, so opening a project silently discarded edits. **New** and **Open** now share a save / don't save / cancel guard, and both refuse while recording, narrating or running a background job.
+
+**Performance**
+- WSOLA uses a coarse-to-fine search: a step-4 decimated correlation, then a ±3 full-rate refine. 60 s of stereo compresses to 30 s in about 0.17 s.
+- The dead-air scan decodes a JPEG only when the frame index entry actually changes. Unchanged screens are stored as repeated index entries, so idle stretches cost nothing. Pixels are compared on a 4-pixel grid against the still run's anchor frame.
+- The timeline skips drawing off-screen segments.
+
+**Robustness**
+- Compaction writes new files under a new name, `fsync`s them, then saves `project.txt`. A crash at any point leaves a valid project, either old or new. Old media is deleted only after the save succeeds.
+- Export, the dead-air scan and compaction all run as one cancellable background job with progress. Quitting asks before cancelling it.
+
 ### Known limitations and roadmap
 
 - MJPEG files are larger than H.264, roughly 2–8 MB/s at 1080p30 depending on content and preset. Use Half-res or Draft for long recordings, and MP4 export for sharing.
 - Audio tracks are held in RAM: about 5.7 MB per minute for a mono track.
+- Speeding up and dead-air removal operate on whole video frames (1/fps). The audio is cut on the same boundaries.
+- Compact project flattens the edit (it becomes one segment), and undo history is cleared.
 - System audio records the default output only. Choosing a specific output, or a single app's audio, is not supported yet.
 - Planned: Wayland capture through the xdg-desktop-portal/PipeWire screencast, webcam overlay, text and arrow annotations, global hotkeys, and per-app audio capture.
 
 ---
 
 ## 9. Changelog
+
+**1.2.0** (2026-11-27):
+- Fix: **MOV/MP4 export greyed out** when ffmpeg wasn't on PATH (typical on Windows). ScreenReel now searches common install locations, remembers **Locate ffmpeg…**, honours `SCREENREEL_FFMPEG` and explains how to install ffmpeg
+- **New** project button and **Ctrl+N**, with an unsaved-changes prompt (also added to **Open…**, which previously discarded edits)
+- **Double-tap Space** jumps back to 0:00
+- **Ctrl+X** cuts the selection
+- **Find dead air… / Remove dead air (N)**: detects silent, static stretches; one-step removal
+- **Compact project…**: lossless rewrite of the recording to reclaim disk space
+- **Speed up selection** (1.25×–16×, stackable to 64×): lossless frame-skipping video, pitch-preserving (WSOLA) or muted audio, green "N×" segments; new `seg=F` and `media=` project keys
+- `--selftest` adds WSOLA pitch/length checks, speed-up, split invariance, dead-air detection and compaction byte-equality
 
 **1.1.0** (2026-11-27):
 - **System audio** checkbox: records the computer's sound output to its own stereo **System** track, next to the mic (WASAPI loopback on Windows, default-sink monitor on PulseAudio/PipeWire on Linux)

@@ -1,8 +1,8 @@
-# ScreenReel v1.1.0 — lightweight screen recorder/editor (Rust + FLTK)
-# Single-file source: screenreel_v1.1.0.rs  |  build helper: build_screenreel_v1.1.0.sh
+# ScreenReel v1.2.0 — lightweight screen recorder/editor (Rust + FLTK)
+# Single-file source: screenreel_v1.2.0.rs  |  build helper: build_screenreel_v1.2.0.sh
 [package]
 name = "screenreel"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.79"          # std::path::absolute
 description = "Lightweight ScreenPal-style screen recorder with lossless (no re-encode) editing"
@@ -10,7 +10,7 @@ license = "MIT"
 
 [[bin]]
 name = "screenreel"
-path = "screenreel_v1.1.0.rs"
+path = "screenreel_v1.2.0.rs"
 
 [dependencies]
 fltk = { version = "1.5", features = ["no-pango"] }          # FLTK statically linked; no pango/cairo

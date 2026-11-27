@@ -1,5 +1,5 @@
-//! ScreenReel v1.1.0 — lightweight screen recorder + editor (Rust + FLTK)
-//! File: screenreel_v1.1.0.rs
+//! ScreenReel v1.2.0 — lightweight screen recorder + editor (Rust + FLTK)
+//! File: screenreel_v1.2.0.rs
 //!
 //! Design summary
 //! --------------
@@ -15,6 +15,13 @@
 //!
 //! Changelog
 //! ---------
+//! 1.2.0  MOV/MP4 fix: ffmpeg is found beyond PATH (env override, saved choice, exe dir,
+//!        WinGet/Scoop/Chocolatey/Program Files) with a Locate dialog; CREATE_NO_WINDOW.
+//!        New project (button + Ctrl+N) with unsaved-changes guard (also on Open).
+//!        Double-Space returns to 0; Ctrl+X cuts. Dead-air finder (silent + static) with
+//!        one-step removal; Compact project (lossless media rewrite to reclaim disk).
+//!        Speed up selection: Seg::Fast (lossless frame skipping) + WSOLA pitch-preserving
+//!        audio compression; project keys seg=F and media=.
 //! 1.1.0  System audio ("System audio" checkbox): records what the computer plays to
 //!        its own stereo "System" track alongside the mic (WASAPI loopback on Windows,
 //!        default-sink monitor via native Pulse/PipeWire stream on Linux). Linux mic and
@@ -48,8 +55,8 @@ use fltk::{
 };
 
 // Every in-file version reference derives from these two constants (bump together).
-const VERSION: &str = "1.1.0";
-const FILE_TAG: &str = "screenreel_v1.1.0";
+const VERSION: &str = "1.2.0";
+const FILE_TAG: &str = "screenreel_v1.2.0";
 const APP_NAME: &str = "ScreenReel";
 const AR: u32 = 48_000; // canonical project audio rate
 const FPS_CHOICES: [u32; 8] = [10, 15, 20, 24, 25, 30, 50, 60]; // all divide 48000 exactly
@@ -1118,7 +1125,7 @@ impl Recorder {
 // Project model: source frames + edit decision list + audio tracks
 // =====================================================================================
 
-struct Source { dir: PathBuf, file: File, idx: Vec<(u64, u32)>, w: u32, h: u32, fps: u32 }
+struct Source { dir: PathBuf, base: String, file: File, idx: Vec<(u64, u32)>, w: u32, h: u32, fps: u32 }
 
 #[cfg(unix)]
 fn read_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<()> { std::os::unix::fs::FileExt::read_exact_at(f, buf, off) }
@@ -1135,11 +1142,14 @@ fn read_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
 }
 
 impl Source {
-    fn open(dir: &Path, w: u32, h: u32, fps: u32) -> Res<Source> {
-        let file = File::open(dir.join("frames.mjpg")).map_err(|e| format!("frames.mjpg: {e}"))?;
+    fn open(dir: &Path, w: u32, h: u32, fps: u32) -> Res<Source> { Source::open_base(dir, "frames", w, h, fps) }
+    /// `base` names the media pair <base>.mjpg/<base>.idx (changes after "Compact project").
+    fn open_base(dir: &Path, base: &str, w: u32, h: u32, fps: u32) -> Res<Source> {
+        if !safe_file_name(base) { return Err("bad media name".into()); }
+        let file = File::open(dir.join(format!("{base}.mjpg"))).map_err(|e| format!("{base}.mjpg: {e}"))?;
         let flen = file.metadata().map_err(es)?.len();
         let mut raw = Vec::new();
-        File::open(dir.join("frames.idx")).map_err(|e| format!("frames.idx: {e}"))?.read_to_end(&mut raw).map_err(es)?;
+        File::open(dir.join(format!("{base}.idx"))).map_err(|e| format!("{base}.idx: {e}"))?.read_to_end(&mut raw).map_err(es)?;
         let mut idx = Vec::with_capacity(raw.len() / 12);
         for e in raw.chunks_exact(12) {
             let off = u64::from_le_bytes(e[..8].try_into().unwrap());
@@ -1151,7 +1161,7 @@ impl Source {
         }
         if idx.is_empty() { return Err("project has no frames".into()); }
         if idx.len() > u32::MAX as usize { return Err("too many frames".into()); }
-        Ok(Source { dir: dir.to_path_buf(), file, idx, w, h, fps })
+        Ok(Source { dir: dir.to_path_buf(), base: base.to_string(), file, idx, w, h, fps })
     }
     fn count(&self) -> u32 { self.idx.len() as u32 }
     fn read(&self, i: u32) -> Res<Vec<u8>> {
@@ -1161,17 +1171,146 @@ impl Source {
         Ok(b)
     }
     fn spf(&self) -> usize { (AR / self.fps) as usize }
+    fn entry(&self, i: u32) -> Option<(u64, u32)> { self.idx.get(i as usize).copied() }
+
+    /// Lossless compaction: write a new media pair holding each frame the edit actually uses
+    /// exactly once, with one index entry per output frame (holds/speed-ups become repeated or
+    /// skipped index entries, 12 bytes each). Returns (new Source, bytes before, bytes after).
+    /// Crash-safe: new files are fully written + fsynced before project.txt points at them.
+    fn compact(&self, edit: &Edit, progress: &AtomicU32) -> Res<(Source, u64, u64)> {
+        let total = edit.total();
+        if total == 0 { return Err("nothing to keep".into()); }
+        let gen = (1..10_000).find(|g| !self.dir.join(format!("frames_c{g}.mjpg")).exists()).ok_or("too many compactions")?;
+        let base = format!("frames_c{gen}");
+        let (pm, pi) = (self.dir.join(format!("{base}.mjpg")), self.dir.join(format!("{base}.idx")));
+        let res = (|| -> Res<u64> {
+            let mut data = BufWriter::with_capacity(4 << 20, File::create(&pm).map_err(es)?);
+            let mut idx = BufWriter::with_capacity(64 << 10, File::create(&pi).map_err(es)?);
+            let mut seen: HashMap<u64, (u64, u32)> = HashMap::new(); // old offset -> new entry
+            let mut off = 0u64;
+            let mut buf = Vec::new();
+            let mut f = 0u32;
+            for s in &edit.segs {
+                for k in 0..s.len() {
+                    let sf = s.src_at(k);
+                    let (o, l) = self.entry(sf).ok_or("edit references missing frame")?;
+                    let e = match seen.get(&o) { Some(e) => *e, None => {
+                        buf.resize(l as usize, 0);
+                        read_at(&self.file, &mut buf, o).map_err(es)?;
+                        data.write_all(&buf).map_err(es)?;
+                        let e = (off, l); off += l as u64; seen.insert(o, e); e
+                    } };
+                    idx.write_all(&e.0.to_le_bytes()).map_err(es)?;
+                    idx.write_all(&e.1.to_le_bytes()).map_err(es)?;
+                    f += 1;
+                    if f % 64 == 0 { progress.store((f as u64 * 1000 / total as u64) as u32, Relaxed); }
+                }
+            }
+            data.into_inner().map_err(|e| e.to_string())?.sync_all().map_err(es)?;
+            idx.into_inner().map_err(|e| e.to_string())?.sync_all().map_err(es)?;
+            Ok(off)
+        })();
+        let after = match res { Ok(n) => n, Err(e) => { let _ = std::fs::remove_file(&pm); let _ = std::fs::remove_file(&pi); return Err(e); } };
+        let before = self.file.metadata().map(|m| m.len()).unwrap_or(0);
+        let ns = Source::open_base(&self.dir, &base, self.w, self.h, self.fps)?;
+        Ok((ns, before, after))
+    }
 }
 
+/// Edit-list segment. `Fast` plays source frames start + floor((ph+k)*sp/100) for output
+/// frame k: `sp` is speed x100 (150 = 1.5x) and `ph` the phase, so splitting a Fast segment
+/// anywhere keeps the exact same frame mapping on both sides (no drift, lossless merge).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Seg { Src { start: u32, len: u32 }, Hold { frame: u32, len: u32 } }
+enum Seg { Src { start: u32, len: u32 }, Hold { frame: u32, len: u32 }, Fast { start: u32, len: u32, sp: u32, ph: u32 } }
+
+const SPEED_MIN: u32 = 101; // x100
+const SPEED_MAX: u32 = 6400; // 64x (combined, after repeated speed-ups)
 
 impl Seg {
-    fn len(&self) -> u32 { match *self { Seg::Src { len, .. } | Seg::Hold { len, .. } => len } }
-    fn src_at(&self, k: u32) -> u32 { match *self { Seg::Src { start, .. } => start + k, Seg::Hold { frame, .. } => frame } }
-    fn sub(&self, a: u32, b: u32) -> Seg {
-        match *self { Seg::Src { start, .. } => Seg::Src { start: start + a, len: b - a }, Seg::Hold { frame, .. } => Seg::Hold { frame, len: b - a } }
+    fn len(&self) -> u32 { match *self { Seg::Src { len, .. } | Seg::Hold { len, .. } | Seg::Fast { len, .. } => len } }
+    fn src_at(&self, k: u32) -> u32 {
+        match *self {
+            Seg::Src { start, .. } => start + k,
+            Seg::Hold { frame, .. } => frame,
+            // u64 math: (ph+k)*sp cannot overflow; result is validated <= last source frame
+            Seg::Fast { start, sp, ph, .. } => start + ((ph as u64 + k as u64) * sp as u64 / 100) as u32,
+        }
     }
+    fn sub(&self, a: u32, b: u32) -> Seg {
+        match *self {
+            Seg::Src { start, .. } => Seg::Src { start: start + a, len: b - a },
+            Seg::Hold { frame, .. } => Seg::Hold { frame, len: b - a },
+            Seg::Fast { start, sp, ph, .. } => Seg::Fast { start, len: b - a, sp, ph: ph + a },
+        }
+    }
+    /// Highest source frame this segment touches (for load-time validation).
+    fn max_src(&self) -> u64 {
+        match *self {
+            Seg::Src { start, len } => start as u64 + len.max(1) as u64 - 1,
+            Seg::Hold { frame, .. } => frame as u64,
+            Seg::Fast { start, len, sp, ph } => start as u64 + (ph as u64 + len.max(1) as u64 - 1) * sp as u64 / 100,
+        }
+    }
+}
+
+/// Pitch-preserving time compression (WSOLA) of interleaved PCM to exactly `out_frames`.
+/// Window 20 ms, 50% overlap Hann OLA; each grain is aligned to the natural continuation
+/// of the previous one by a coarse-to-fine cross-correlation search (±5 ms), so speech
+/// stays intelligible without chipmunk pitch. O(n) in output length with a bounded search.
+fn time_stretch(x: &[i16], ch: usize, out_frames: usize) -> Vec<i16> {
+    let n_in = x.len() / ch.max(1);
+    if out_frames == 0 || n_in == 0 { return vec![0; out_frames * ch]; }
+    if out_frames >= n_in { let mut v = x[..n_in * ch].to_vec(); v.resize(out_frames * ch, 0); return v; }
+    const W: usize = 960; // 20 ms @ 48 kHz
+    const HS: usize = W / 2;
+    const TOL: usize = 240; // ±5 ms search
+    if n_in < W * 2 || out_frames < W {
+        // too short for grains: nearest-frame decimation (still exact length)
+        let mut v = Vec::with_capacity(out_frames * ch);
+        for k in 0..out_frames { let i = k * n_in / out_frames; v.extend_from_slice(&x[i * ch..i * ch + ch]); }
+        return v;
+    }
+    let mono = |i: usize| -> f32 { let b = i * ch; (0..ch).map(|c| x[b + c] as f32).sum::<f32>() / ch as f32 };
+    let win: Vec<f32> = (0..W).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / W as f32).cos()).collect();
+    let mut acc = vec![0f32; (out_frames + W) * ch];
+    let mut wsum = vec![0f32; out_frames + W];
+    let ratio = n_in as f64 / out_frames as f64;
+    let mut prev: usize = 0; // input position of previous grain
+    let mut k = 0usize;
+    while k * HS < out_frames {
+        let o = k * HS;
+        let nominal = ((o as f64) * ratio) as usize;
+        let pos = if k == 0 { 0 } else {
+            // template = natural continuation of the previous grain
+            let tpl = prev + HS;
+            let lo = nominal.saturating_sub(TOL);
+            let hi = (nominal + TOL).min(n_in.saturating_sub(W));
+            if tpl + W > n_in || lo > hi { nominal.min(n_in.saturating_sub(W)) } else {
+                let score = |c: usize, step: usize| -> f32 { let mut s = 0f32; let mut i = 0; while i < HS { s += mono(tpl + i) * mono(c + i); i += step; } s };
+                let mut best = lo; let mut bs = f32::MIN;
+                let mut c = lo; while c <= hi { let v = score(c, 4); if v > bs { bs = v; best = c; } c += 4; }
+                let (l2, h2) = (best.saturating_sub(3).max(lo), (best + 3).min(hi));
+                bs = f32::MIN; for c in l2..=h2 { let v = score(c, 1); if v > bs { bs = v; best = c; } }
+                best
+            }
+        };
+        let pos = pos.min(n_in.saturating_sub(W));
+        for i in 0..W {
+            let (si, di) = (pos + i, o + i);
+            if si >= n_in || di >= out_frames + W { break; }
+            let w = win[i];
+            for c in 0..ch { acc[di * ch + c] += x[si * ch + c] as f32 * w; }
+            wsum[di] += w;
+        }
+        prev = pos;
+        k += 1;
+    }
+    let mut out = Vec::with_capacity(out_frames * ch);
+    for i in 0..out_frames {
+        let w = if wsum[i] > 1e-3 { wsum[i] } else { 1.0 };
+        for c in 0..ch { out.push((acc[i * ch + c] / w).round().clamp(-32768.0, 32767.0) as i16); }
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -1222,6 +1361,9 @@ impl Edit {
                 match (*last, s) {
                     (Seg::Src { start: a, len: la }, Seg::Src { start: b, len: lb }) if a + la == b => { *last = Seg::Src { start: a, len: la + lb }; continue; }
                     (Seg::Hold { frame: a, len: la }, Seg::Hold { frame: b, len: lb }) if a == b => { *last = Seg::Hold { frame: a, len: la + lb }; continue; }
+                    (Seg::Fast { start: a, len: la, sp: pa, ph: ha }, Seg::Fast { start: b, len: lb, sp: pb, ph: hb }) if a == b && pa == pb && ha + la == hb => {
+                        *last = Seg::Fast { start: a, len: la + lb, sp: pa, ph: ha }; continue;
+                    }
                     _ => {}
                 }
             }
@@ -1291,6 +1433,57 @@ impl Edit {
         t.data = Arc::new(v);
     }
 
+    /// Speed up output frames [a,b) by `sp`/100 (ripple). Video: each segment piece becomes a
+    /// Fast segment (Hold pieces just get shorter). Audio: the range is WSOLA-compressed to the
+    /// exact new length (or silenced when `mute`). Returns the new end frame.
+    fn speed_range(&mut self, a: u32, b: u32, sp: u32, mute: bool, spf: usize) -> u32 {
+        if b <= a || sp < SPEED_MIN { return b; }
+        let i = self.split(a);
+        let j = self.split(b);
+        let mut new: Vec<Seg> = Vec::with_capacity(j - i);
+        for s in &self.segs[i..j] {
+            let l = s.len() as u64;
+            let nl = ((l * 100 + sp as u64 - 1) / sp as u64).max(1) as u32; // ceil
+            match *s {
+                Seg::Hold { frame, .. } => new.push(Seg::Hold { frame, len: nl }),
+                Seg::Src { .. } | Seg::Fast { .. } => {
+                    let (old_sp, last) = match *s { Seg::Fast { sp: o, .. } => (o, s.max_src()), _ => (100, s.max_src()) };
+                    let csp = (old_sp as u64 * sp as u64 / 100).clamp(SPEED_MIN as u64, SPEED_MAX as u64) as u32;
+                    let start = s.src_at(0);
+                    let mut nl = ((l * old_sp as u64 + csp as u64 - 1) / csp as u64).max(1) as u32;
+                    // never read past the original piece's last source frame
+                    while nl > 1 && start as u64 + (nl as u64 - 1) * csp as u64 / 100 > last { nl -= 1; }
+                    new.push(Seg::Fast { start, len: nl, sp: csp, ph: 0 });
+                }
+            }
+        }
+        let old_len = b - a;
+        let new_len: u32 = new.iter().map(|s| s.len()).sum();
+        self.segs.splice(i..j, new);
+        self.normalize();
+        for t in &mut self.tracks {
+            let ch = t.ch as usize;
+            let (s0, e0) = ((a as usize * spf * ch).min(t.data.len()), (b as usize * spf * ch).min(t.data.len()));
+            if s0 >= e0 { continue; }
+            let avail = (e0 - s0) / ch;
+            // partial coverage keeps the same proportion of the new range
+            let out = (avail as u64 * new_len as u64 * spf as u64 / (old_len as u64 * spf as u64).max(1)) as usize;
+            let mid = if mute { vec![0i16; out * ch] } else { time_stretch(&t.data[s0..e0], ch, out) };
+            let mut v = Vec::with_capacity(t.data.len() - (e0 - s0) + mid.len());
+            v.extend_from_slice(&t.data[..s0]);
+            v.extend_from_slice(&mid);
+            v.extend_from_slice(&t.data[e0..]);
+            t.data = Arc::new(v);
+        }
+        a + new_len
+    }
+
+    /// Remove several output ranges (sorted, non-overlapping) in one pass, last first so
+    /// earlier indices stay valid.
+    fn cut_many(&mut self, ranges: &[(u32, u32)], spf: usize) {
+        for &(a, b) in ranges.iter().rev() { self.cut(a, b, spf); }
+    }
+
     /// Overwrite track samples starting at frame `at` (mono input, upmixed if needed);
     /// optionally silence up to `clear_to` frame.
     fn write_track(&mut self, ti: usize, at: u32, mono: &[i16], clear_to: Option<u32>, spf: usize) {
@@ -1323,9 +1516,13 @@ fn sanitize_name(s: &str) -> String {
 impl Project {
     fn save(&mut self) -> Res<()> {
         let dir = self.src.dir.clone();
-        let mut txt = format!("screenreel_project=1\nversion={VERSION}\nwidth={}\nheight={}\nfps={}\n", self.src.w, self.src.h, self.src.fps);
+        let mut txt = format!("screenreel_project=1\nversion={VERSION}\nwidth={}\nheight={}\nfps={}\nmedia={}\n", self.src.w, self.src.h, self.src.fps, self.src.base);
         for s in &self.edit.segs {
-            match s { Seg::Src { start, len } => txt += &format!("seg=S {start} {len}\n"), Seg::Hold { frame, len } => txt += &format!("seg=H {frame} {len}\n") }
+            txt += &match *s {
+                Seg::Src { start, len } => format!("seg=S {start} {len}\n"),
+                Seg::Hold { frame, len } => format!("seg=H {frame} {len}\n"),
+                Seg::Fast { start, len, sp, ph } => format!("seg=F {start} {len} {sp} {ph}\n"),
+            };
         }
         let mut keep = Vec::new();
         for (i, t) in self.edit.tracks.iter().enumerate() {
@@ -1353,6 +1550,7 @@ impl Project {
         let txt = std::fs::read_to_string(dir.join("project.txt")).map_err(|e| format!("project.txt: {e}"))?;
         if txt.len() > 16 << 20 { return Err("project.txt too large".into()); }
         let (mut w, mut h, mut fps, mut magic) = (0u32, 0u32, 0u32, false);
+        let mut media = String::from("frames");
         let mut segs = Vec::new();
         let mut tdefs = Vec::new();
         for line in txt.lines() {
@@ -1362,11 +1560,22 @@ impl Project {
                 "width" => w = v.parse().map_err(es)?,
                 "height" => h = v.parse().map_err(es)?,
                 "fps" => fps = v.parse().map_err(es)?,
+                "media" => { if !safe_file_name(v) { return Err("bad media name".into()); } media = v.to_string(); }
                 "seg" => {
                     let p: Vec<&str> = v.split_whitespace().collect();
-                    if p.len() != 3 { return Err(format!("bad seg line: {line}")); }
-                    let (a, b): (u32, u32) = (p[1].parse().map_err(es)?, p[2].parse().map_err(es)?);
-                    segs.push(match p[0] { "S" => Seg::Src { start: a, len: b }, "H" => Seg::Hold { frame: a, len: b }, _ => return Err("bad seg kind".into()) });
+                    let num = |i: usize| -> Res<u32> { p.get(i).ok_or_else(|| format!("bad seg line: {line}"))?.parse().map_err(es) };
+                    let seg = match (p.first().copied(), p.len()) {
+                        (Some("S"), 3) => Seg::Src { start: num(1)?, len: num(2)? },
+                        (Some("H"), 3) => Seg::Hold { frame: num(1)?, len: num(2)? },
+                        (Some("F"), 5) => {
+                            let sp = num(3)?;
+                            if !(SPEED_MIN..=SPEED_MAX).contains(&sp) { return Err(format!("bad speed: {line}")); }
+                            Seg::Fast { start: num(1)?, len: num(2)?, sp, ph: num(4)? }
+                        }
+                        _ => return Err(format!("bad seg line: {line}")),
+                    };
+                    if segs.len() >= 1 << 20 { return Err("too many segments".into()); }
+                    segs.push(seg);
                 }
                 "track" => {
                     let p: Vec<&str> = v.split('|').collect();
@@ -1379,12 +1588,16 @@ impl Project {
         }
         if !magic { return Err("not a ScreenReel project".into()); }
         if !FPS_CHOICES.contains(&fps) || w == 0 || h == 0 || w > 16384 || h > 16384 { return Err("invalid project header".into()); }
-        let src = Arc::new(Source::open(&dir, w, h, fps)?);
-        let n = src.count();
+        let src = Arc::new(Source::open_base(&dir, &media, w, h, fps)?);
+        let n = src.count() as u64;
+        let mut total = 0u64;
         for s in &segs {
-            let ok = match *s { Seg::Src { start, len } => start.checked_add(len).map(|e| e <= n).unwrap_or(false), Seg::Hold { frame, len } => frame < n && len > 0 };
-            if !ok { return Err("segment references frames outside the recording".into()); }
+            // u64 max_src: a hostile seg line cannot overflow into a "valid" frame
+            if s.len() == 0 || s.max_src() >= n { return Err("segment references frames outside the recording".into()); }
+            if let Seg::Fast { ph, .. } = *s { if ph > u32::MAX / 2 { return Err("bad segment phase".into()); } }
+            total += s.len() as u64;
         }
+        if total > u32::MAX as u64 / 2 { return Err("project too long".into()); }
         let mut tracks = Vec::new();
         for (name, gain, muted, f) in tdefs {
             let (ch, data) = decode_audio(&dir.join(&f))?;
@@ -1550,7 +1763,86 @@ mod mkv {
     pub fn cat(parts: &[Vec<u8>]) -> Vec<u8> { parts.concat() }
 }
 
-struct ExportJob { progress: Arc<AtomicU32>, cancel: Arc<AtomicBool>, handle: JoinHandle<Res<String>>, label: String }
+/// Background job (export, dead-air scan, compaction). Progress is 0..=1000.
+struct Job { progress: Arc<AtomicU32>, cancel: Arc<AtomicBool>, handle: JoinHandle<Res<JobOut>>, label: String }
+
+enum JobOut {
+    Msg(String),
+    /// Dead-air ranges plus the edit generation they were computed for.
+    DeadAir { ranges: Vec<(u32, u32)>, gen: u64 },
+    Compact { src: Source, before: u64, after: u64 },
+}
+
+/// Dead-air scan parameters (output-frame units after conversion).
+#[derive(Clone, Copy)]
+struct DeadCfg { min_frames: u32, pad_frames: u32, /** full-scale 0..1 */ silence_peak: f32, px_diff: u8, still_frac: f64 }
+
+impl Default for DeadCfg {
+    // -45 dBFS peak counts as silence; >0.05 % of sampled pixels changing by >40/255
+    // relative to the start of the still run counts as motion (cursor drift alone does not).
+    fn default() -> Self { DeadCfg { min_frames: 60, pad_frames: 6, silence_peak: 0.0056, px_diff: 40, still_frac: 0.0005 } }
+}
+
+/// Find output-frame ranges where the audible mix is silent AND the picture is static.
+/// Runs on a worker thread; reads JPEGs only when the index entry actually changed
+/// (the recorder stores unchanged screens as repeated index entries, so idle stretches
+/// cost nothing) and compares to the run's anchor frame on a 4-px grid (O(pixels/16)).
+fn find_dead_air(src: &Source, edit: &Edit, cfg: DeadCfg, progress: &AtomicU32, cancel: &AtomicBool) -> Res<Vec<(u32, u32)>> {
+    let total = edit.total();
+    let spf = src.spf();
+    let mix = mix_tracks(edit, None);
+    let silent = |f: u32| -> bool {
+        let b = f as usize * spf;
+        (b..b + spf).all(|i| { let (l, r) = mix_frame(&mix, i); l.abs() < cfg.silence_peak && r.abs() < cfg.silence_peak })
+    };
+    let differs = |a: &[u8], b: &[u8], w: usize, h: usize| -> bool {
+        let (mut n, mut changed) = (0u64, 0u64);
+        let mut y = 0; while y < h { let mut x = 0; while x < w {
+            let i = (y * w + x) * 3;
+            let d = (0..3).map(|c| a[i + c].abs_diff(b[i + c])).max().unwrap_or(0);
+            if d > cfg.px_diff { changed += 1; }
+            n += 1; x += 4; } y += 4; }
+        changed as f64 > n as f64 * cfg.still_frac
+    };
+    let mut out = Vec::new();
+    let mut run_start: Option<u32> = None;
+    let mut anchor: Option<(u64, Vec<u8>, usize, usize)> = None; // (offset, rgb, w, h)
+    let mut f = 0u32;
+    // flat iteration over segments avoids O(n*segs) src_frame lookups
+    let frames: Box<dyn Iterator<Item = u32>> = Box::new(edit.segs.iter().flat_map(|s| (0..s.len()).map(move |k| s.src_at(k))));
+    let close = |out: &mut Vec<(u32, u32)>, a: u32, b: u32| {
+        // keep `pad` frames of context on each side so cuts never feel abrupt
+        let (a2, b2) = (if a == 0 { 0 } else { a + cfg.pad_frames }, if b >= total { total } else { b.saturating_sub(cfg.pad_frames) });
+        if b2 > a2 && b2 - a2 >= cfg.min_frames.max(1) { out.push((a2, b2)); }
+    };
+    for sf in frames {
+        if f % 256 == 0 {
+            if cancel.load(Relaxed) { return Err("scan cancelled".into()); }
+            progress.store((f as u64 * 1000 / total.max(1) as u64) as u32, Relaxed);
+        }
+        let (off, _) = src.entry(sf).ok_or("missing frame")?;
+        let still = match &anchor {
+            Some((ao, ..)) if *ao == off => true,
+            Some((_, argb, w, h)) => {
+                let (rgb, w2, h2) = decode_jpeg_rgb(&src.read(sf)?)?;
+                let s = w2 == *w && h2 == *h && !differs(argb, &rgb, w2, h2);
+                if !s { anchor = Some((off, rgb, w2, h2)); }
+                s
+            }
+            None => { let (rgb, w, h) = decode_jpeg_rgb(&src.read(sf)?)?; anchor = Some((off, rgb, w, h)); false }
+        };
+        let dead = still && silent(f);
+        match (dead, run_start) {
+            (true, None) => run_start = Some(f),
+            (false, Some(a)) => { close(&mut out, a, f); run_start = None; }
+            _ => {}
+        }
+        f += 1;
+    }
+    if let Some(a) = run_start { close(&mut out, a, total); }
+    progress.store(1000, Relaxed);
+    Ok(out)
+}
 
 fn export_mkv(path: &Path, src: &Source, edit: &Edit, progress: &AtomicU32, cancel: &AtomicBool) -> Res<()> {
     use mkv::*;
@@ -1662,14 +1954,83 @@ fn export_wav(path: &Path, src: &Source, edit: &Edit) -> Res<()> {
     write_wav(path, 2, AR, &out)
 }
 
-fn ffmpeg_available() -> bool {
-    std::process::Command::new("ffmpeg").arg("-version").stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+// ---- ffmpeg discovery -----------------------------------------------------------------
+// v1.1.0 only tried `ffmpeg` on PATH, so on Windows (where winget/scoop/manual installs often
+// do not touch the PATH of an already-running Explorer) MOV/MP4 were permanently greyed out.
+// Discovery order: $SCREENREEL_FFMPEG, saved user choice, next to our exe, PATH, then the
+// well-known Windows package-manager shim folders. Candidates are checked by file existence
+// first (cheap) and only the first hit is executed (`-version`) to confirm it works.
+
+fn ffmpeg_exe_name() -> &'static str { if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" } }
+
+fn config_dir() -> Option<PathBuf> {
+    #[cfg(windows)] { std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(APP_NAME)) }
+    #[cfg(not(windows))] {
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|d| d.join("screenreel"))
+    }
+}
+
+fn saved_ffmpeg() -> Option<PathBuf> {
+    let t = std::fs::read_to_string(config_dir()?.join("ffmpeg_path")).ok()?;
+    let p = PathBuf::from(t.trim());
+    if p.as_os_str().is_empty() || t.len() > 4096 { None } else { Some(p) }
+}
+
+fn save_ffmpeg_choice(p: &Path) -> Res<()> {
+    let d = config_dir().ok_or("no config directory")?;
+    std::fs::create_dir_all(&d).map_err(es)?;
+    let tmp = d.join("ffmpeg_path.tmp");
+    std::fs::write(&tmp, p.to_string_lossy().as_bytes()).map_err(es)?;
+    std::fs::rename(&tmp, d.join("ffmpeg_path")).map_err(es)
+}
+
+fn ffmpeg_cmd(exe: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(exe);
+    #[cfg(windows)] {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash from the GUI app
+    }
+    c.stdin(std::process::Stdio::null());
+    c
+}
+
+/// True if `exe` runs and prints an ffmpeg banner (bounded: ffmpeg -version exits at once).
+fn ffmpeg_works(exe: &Path) -> bool {
+    ffmpeg_cmd(exe).arg("-version").stderr(std::process::Stdio::null()).output()
+        .map(|o| o.status.success() && o.stdout.starts_with(b"ffmpeg version")).unwrap_or(false)
+}
+
+fn ffmpeg_candidates() -> Vec<PathBuf> {
+    let name = ffmpeg_exe_name();
+    let mut v: Vec<PathBuf> = Vec::new();
+    if let Some(e) = std::env::var_os("SCREENREEL_FFMPEG") { v.push(PathBuf::from(e)); }
+    if let Some(p) = saved_ffmpeg() { v.push(p); }
+    if let Some(d) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) { v.push(d.join(name)); }
+    if let Some(path) = std::env::var_os("PATH") { for d in std::env::split_paths(&path) { v.push(d.join(name)); } }
+    #[cfg(windows)] {
+        let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
+        if let Some(l) = env("LOCALAPPDATA") { v.push(l.join(r"Microsoft\WinGet\Links").join(name)); }
+        if let Some(u) = env("USERPROFILE") { v.push(u.join(r"scoop\shims").join(name)); }
+        if let Some(pd) = env("ProgramData") { v.push(pd.join(r"chocolatey\bin").join(name)); }
+        for pf in ["ProgramFiles", "ProgramFiles(x86)"] { if let Some(p) = env(pf) { v.push(p.join(r"ffmpeg\bin").join(name)); } }
+        v.push(PathBuf::from(r"C:\ffmpeg\bin").join(name));
+    }
+    #[cfg(not(windows))] { for d in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/snap/bin"] { v.push(Path::new(d).join(name)); } }
+    v
+}
+
+fn find_ffmpeg() -> Option<PathBuf> {
+    let mut tried = std::collections::HashSet::new();
+    ffmpeg_candidates().into_iter()
+        .filter(|p| p.is_file() && tried.insert(p.clone()))
+        .find(|p| ffmpeg_works(p))
 }
 
 /// Run ffmpeg on an exported MKV. Args are passed as argv (no shell → no injection).
-fn ffmpeg_convert(input: &Path, output: &Path, lossless_remux: bool) -> Res<()> {
-    let mut c = std::process::Command::new("ffmpeg");
+fn ffmpeg_convert(exe: &Path, input: &Path, output: &Path, lossless_remux: bool) -> Res<()> {
+    let mut c = ffmpeg_cmd(exe);
     c.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(input);
     if lossless_remux {
         c.args(["-c", "copy", "-f", "mov"]);
@@ -1677,7 +2038,7 @@ fn ffmpeg_convert(input: &Path, output: &Path, lossless_remux: bool) -> Res<()> 
         c.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "mp4"]);
     }
-    c.arg(output).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
+    c.arg(output).stdout(std::process::Stdio::null());
     let out = c.output().map_err(|e| format!("ffmpeg: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -1744,7 +2105,12 @@ struct App {
     peaks: HashMap<usize, Arc<Vec<(i16, i16)>>>,
     rec: Option<Recorder>, rec_pending: bool, ctl: Option<Ctl>, narr: Option<NarrRec>,
     dec: Decoder, preview: Option<(RgbImage, u32)>,
-    export: Option<ExportJob>, mics: Vec<String>, status: String, ffmpeg: bool,
+    job: Option<Job>, mics: Vec<String>, status: String, ffmpeg: Option<PathBuf>,
+    /// Bumped on every edit; dead-air results are only shown/applied for the generation
+    /// they were computed on (any edit invalidates them, so a stale range is never cut).
+    edit_gen: u64, dead: Vec<(u32, u32)>, dead_gen: u64,
+    /// Double-Space detection: time of the last Space press and the play state before it.
+    space_at: Option<(Instant, bool)>,
 }
 
 impl App {
@@ -1759,6 +2125,52 @@ impl App {
             p.redo.clear();
             p.dirty = true;
         }
+        self.edit_gen += 1;
+    }
+
+    fn dead_valid(&self) -> bool { self.dead_gen == self.edit_gen && !self.dead.is_empty() }
+
+    /// Replace the open project (New/Open). Stops playback and clears per-project state.
+    fn set_project(&mut self, p: Option<Project>, tl_w: i32) {
+        self.set_playing(false);
+        let n = p.as_ref().map(|p| p.edit.total()).unwrap_or(0);
+        self.proj = p;
+        self.sel = None; self.sel_track = None; self.drag_anchor = None;
+        self.scroll = 0.0;
+        self.zoom = (tl_w as f64 / n.max(1) as f64).max(1e-4);
+        self.preview = None; self.peaks.clear();
+        self.dead.clear(); self.edit_gen += 1;
+        self.after_edit();
+        self.seek(0);
+    }
+
+    /// Speed up the selection by sp/100 (ripple; audio pitch-preserved or muted).
+    fn op_speed(&mut self, sp: u32, mute: bool) -> Res<()> {
+        let (a, b) = self.sel.ok_or("Select a range to speed up (drag on the timeline)")?;
+        if !(SPEED_MIN..=SPEED_MAX).contains(&sp) { return Err("invalid speed".into()); }
+        self.push_undo();
+        let spf = self.spf();
+        let end = self.proj.as_mut().unwrap().edit.speed_range(a, b, sp, mute, spf);
+        self.sel = Some((a, end));
+        self.playhead = a;
+        self.after_edit();
+        let fps = self.fps() as f64;
+        self.status = format!("Sped up {:.2}s → {:.2}s ({}×{})", (b - a) as f64 / fps, (end - a) as f64 / fps, fmt_speed(sp), if mute { ", audio muted" } else { "" });
+        Ok(())
+    }
+
+    /// Cut every detected dead-air range as one undo step.
+    fn op_remove_dead(&mut self) -> Res<()> {
+        if !self.dead_valid() { return Err("Run \"Find dead air\" first (results are cleared by any edit)".into()); }
+        let ranges = std::mem::take(&mut self.dead);
+        let frames: u32 = ranges.iter().map(|(a, b)| b - a).sum();
+        self.push_undo();
+        let spf = self.spf();
+        self.proj.as_mut().unwrap().edit.cut_many(&ranges, spf);
+        self.sel = None;
+        self.after_edit();
+        self.status = format!("Removed {} dead-air region(s), {:.1}s. Use Compact project to reclaim disk space.", ranges.len(), frames as f64 / self.fps() as f64);
+        Ok(())
     }
 
     /// Re-sync mixer + clamp cursor after any edit.
@@ -1832,6 +2244,7 @@ impl App {
             let (from, to) = if redo { (&mut p.redo, &mut p.undo) } else { (&mut p.undo, &mut p.redo) };
             if let Some(e) = from.pop() { to.push(std::mem::replace(&mut p.edit, e)); p.dirty = true; }
         }
+        self.edit_gen += 1;
         self.after_edit();
     }
 
@@ -1920,12 +2333,23 @@ struct Ui {
     undo: Button, redo: Button, narr: Button, fitz: Button,
     track: Choice, mute: Button, gain: HorNiceSlider, shl: Button, shr: Button, newt: Button, import: Button, replace: Button, remove: Button,
     timeline: Frame, status: Frame,
+    // v1.2.0
+    new: Button, speed: Choice, speed_mute: CheckButton, speed_btn: Button, find_dead: Button, rm_dead: Button, compact: Button,
 }
+
+/// Speed choices (x100) shown in the "Speed" menu, in order.
+const SPEEDS: [u32; 7] = [125, 150, 200, 300, 400, 800, 1600];
 
 type Shared = std::rc::Rc<std::cell::RefCell<App>>;
 
 const RULER_H: i32 = 18;
 const VLANE_H: i32 = 28;
+
+/// 150 -> "1.5", 200 -> "2", 125 -> "1.25"
+fn fmt_speed(sp: u32) -> String {
+    let t = format!("{}.{:02}", sp / 100, sp % 100);
+    t.trim_end_matches('0').trim_end_matches('.').to_string()
+}
 
 fn fmt_time(frames: u32, fps: u32) -> String {
     let cs = (frames as u64 * 100 + fps.max(1) as u64 / 2) / fps.max(1) as u64; // rounded centiseconds
@@ -1978,13 +2402,28 @@ fn draw_timeline(app: &mut App, tl: &Frame) {
         draw::draw_rect_fill(xa, y0 + RULER_H, (xb - xa).max(1), h - RULER_H, Color::from_rgb(52, 70, 96));
         draw::draw_rect_fill(xa, y0 + RULER_H - 3, (xb - xa).max(1), 3, Color::from_rgb(120, 170, 255));
     }
+    // Dead-air candidates (only while valid for the current edit)
+    if app.dead_gen == app.edit_gen {
+        for &(a, b) in &app.dead {
+            let (xa, xb) = (fx(a as f64), fx(b as f64));
+            if xb < x0 || xa > x0 + w { continue; }
+            draw::draw_rect_fill(xa, y0 + RULER_H, (xb - xa).max(1), h - RULER_H, Color::from_rgb(78, 36, 40));
+            draw::draw_rect_fill(xa, y0, (xb - xa).max(1), 4, Color::from_rgb(230, 80, 80));
+        }
+    }
     // Video lane
     let vy = y0 + RULER_H;
     let mut acc = 0u32;
     draw::set_font(Font::HelveticaBold, 10);
     for s in &p.edit.segs {
         let (xa, xb) = (fx(acc as f64), fx((acc + s.len()) as f64));
-        let (col, txt) = match s { Seg::Src { .. } => (Color::from_rgb(58, 104, 160), ""), Seg::Hold { .. } => (Color::from_rgb(196, 132, 40), "FREEZE") };
+        if xb < x0 || xa > x0 + w { acc += s.len(); continue; } // off-screen: skip draw
+        let fast;
+        let (col, txt) = match s {
+            Seg::Src { .. } => (Color::from_rgb(58, 104, 160), ""),
+            Seg::Hold { .. } => (Color::from_rgb(196, 132, 40), "FREEZE"),
+            Seg::Fast { sp, .. } => { fast = format!("{}×", fmt_speed(*sp)); (Color::from_rgb(52, 150, 96), fast.as_str()) }
+        };
         draw::draw_rect_fill(xa, vy + 2, (xb - xa).max(1), VLANE_H - 4, col);
         draw::set_draw_color(Color::from_rgb(20, 20, 20));
         draw::draw_yxline(xa, vy + 2, vy + VLANE_H - 2);
@@ -2040,15 +2479,24 @@ fn refresh(app: &Shared, ui: &Ui) {
     let has = a.proj.is_some();
     let total = a.total();
     let fps = a.fps();
-    let busy = a.export.is_some() || a.narr.is_some();
+    let busy = a.job.is_some() || a.narr.is_some();
     for b in [&mut ui.cut, &mut ui.freeze_sel] { if has && a.sel.is_some() && !busy { b.activate() } else { b.deactivate() } }
     for b in [&mut ui.save, &mut ui.ifreeze, &mut ui.play, &mut ui.newt, &mut ui.import, &mut ui.fitz] { if has && !busy { b.activate() } else { b.deactivate() } }
     for b in [&mut ui.exp_mkv, &mut ui.exp_wav] { if has && total > 0 && !busy { b.activate() } else { b.deactivate() } }
-    for b in [&mut ui.exp_mov, &mut ui.exp_mp4] { if has && total > 0 && !busy && a.ffmpeg { b.activate() } else { b.deactivate() } }
+    // MOV/MP4 stay clickable without ffmpeg: the click explains how to get/locate it.
+    for b in [&mut ui.exp_mov, &mut ui.exp_mp4] { if has && total > 0 && !busy { b.activate() } else { b.deactivate() } }
+    for b in [&mut ui.exp_mov, &mut ui.exp_mp4] { b.set_label_color(if a.ffmpeg.is_some() { Color::Foreground } else { Color::from_rgb(120, 120, 120) }); }
+    // New/Open are refused while recording/narrating/exporting (checked again in the callback)
+    for b in [&mut ui.new, &mut ui.open] { if a.rec.is_none() && !a.rec_pending && !busy { b.activate() } else { b.deactivate() } }
+    if has && a.sel.is_some() && !busy { ui.speed_btn.activate() } else { ui.speed_btn.deactivate() }
+    for b in [&mut ui.find_dead, &mut ui.compact] { if has && total > 0 && !busy { b.activate() } else { b.deactivate() } }
+    let dv = a.dead_valid();
+    ui.rm_dead.set_label(&if dv { format!("Remove dead air ({})", a.dead.len()) } else { "Remove dead air".to_string() });
+    if dv && !busy { ui.rm_dead.activate() } else { ui.rm_dead.deactivate() }
     let (cu, cr) = a.proj.as_ref().map(|p| (!p.undo.is_empty(), !p.redo.is_empty())).unwrap_or((false, false));
     if cu && !busy { ui.undo.activate() } else { ui.undo.deactivate() }
     if cr && !busy { ui.redo.activate() } else { ui.redo.deactivate() }
-    if has && a.export.is_none() { ui.narr.activate() } else { ui.narr.deactivate() }
+    if has && a.job.is_none() { ui.narr.activate() } else { ui.narr.deactivate() }
     ui.narr.set_label(if a.narr.is_some() { "■ Stop narration" } else { "● Re-record narration" });
     let st = a.sel_track.is_some() && !busy;
     for b in [&mut ui.mute, &mut ui.shl, &mut ui.shr, &mut ui.replace, &mut ui.remove] { if st { b.activate() } else { b.deactivate() } }
@@ -2357,40 +2805,147 @@ fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
     if p.extension().map(|e| e.eq_ignore_ascii_case(ext)).unwrap_or(false) { p } else { let mut s = p.into_os_string(); s.push("."); s.push(ext); PathBuf::from(s) }
 }
 
+/// Unsaved-changes guard for New/Open. Returns true when it is OK to drop the project.
+fn may_close_project(a: &Shared) -> bool {
+    {
+        let s = a.borrow();
+        if s.rec.is_some() || s.rec_pending || s.narr.is_some() || s.job.is_some() {
+            drop(s);
+            alert("Finish the current recording, narration or background job first.");
+            return false;
+        }
+    }
+    let dirty = a.borrow().proj.as_ref().map(|p| p.dirty).unwrap_or(false);
+    if !dirty { return true; }
+    match dialog::choice2_default("Save changes to the current project first?", "Cancel", "Save", "Don't save") {
+        Some(1) => {
+            let r = a.borrow_mut().proj.as_mut().map(|p| p.save()).unwrap_or(Ok(()));
+            if let Err(e) = r { alert(&format!("Save failed: {e}")); return false; }
+            true
+        }
+        Some(2) => true,
+        _ => false,
+    }
+}
+
+/// Make sure ffmpeg is known before a MOV/MP4 export; offers search-again / locate.
+fn ensure_ffmpeg(a: &Shared) -> Option<PathBuf> {
+    if let Some(p) = a.borrow().ffmpeg.clone() { return Some(p); }
+    loop {
+        let hint = if cfg!(windows) {
+            "Install it with:  winget install Gyan.FFmpeg\n(or scoop install ffmpeg / choco install ffmpeg),\nor put ffmpeg.exe next to ScreenReel.exe."
+        } else { "Install it with your package manager, e.g.  sudo apt install ffmpeg" };
+        let msg = format!("MOV and MP4 export use ffmpeg, which was not found.\n\n{hint}\n\nSearched: SCREENREEL_FFMPEG, saved location, ScreenReel's folder, PATH{}.\n\nMKV and WAV export never need ffmpeg.",
+            if cfg!(windows) { ", WinGet Links, Scoop shims, Chocolatey, Program Files" } else { ", /usr/bin, /usr/local/bin, /snap/bin" });
+        match dialog::choice2_default(&esc(&msg), "Cancel", "Locate ffmpeg…", "Search again") {
+            Some(1) => {
+                let filter = if cfg!(windows) { "ffmpeg\tffmpeg.exe" } else { "ffmpeg\tffmpeg*" };
+                let Some(p) = choose_file("Locate ffmpeg", filter, None) else { continue };
+                if ffmpeg_works(&p) {
+                    if let Err(e) = save_ffmpeg_choice(&p) { a.borrow_mut().status = format!("Using {} (could not remember it: {e})", p.display()); }
+                    a.borrow_mut().ffmpeg = Some(p.clone());
+                    return Some(p);
+                }
+                alert(&format!("{} did not run as ffmpeg.", p.display()));
+            }
+            Some(2) => { if let Some(p) = find_ffmpeg() { a.borrow_mut().ffmpeg = Some(p.clone()); return Some(p); } }
+            _ => return None,
+        }
+    }
+}
+
+/// Spawn a background job and register it (one job at a time).
+fn spawn_job(app: &Shared, ui: &Ui, label: &str, f: impl FnOnce(&AtomicU32, &AtomicBool) -> Res<JobOut> + Send + 'static) {
+    let progress = Arc::new(AtomicU32::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (pg, cc) = (progress.clone(), cancel.clone());
+    let handle = thread::spawn(move || f(&pg, &cc));
+    let mut a = app.borrow_mut();
+    a.job = Some(Job { progress, cancel, handle, label: label.to_string() });
+    a.status = format!("{label}…");
+    drop(a);
+    refresh(app, ui);
+}
+
+fn start_dead_scan(app: &Shared, ui: &Ui) {
+    let (src, edit, gen, fps) = {
+        let mut a = app.borrow_mut();
+        if a.job.is_some() { return; }
+        a.set_playing(false);
+        let Some(p) = &a.proj else { return };
+        (p.src.clone(), p.edit.clone(), a.edit_gen, p.src.fps)
+    };
+    let Some(v) = dialog::input_default("Find dead air: minimum length in seconds\n(silent on all audible tracks AND no picture change)", "2") else { return };
+    let secs: f64 = match v.trim().parse::<f64>() { Ok(x) if x.is_finite() && (0.3..=3600.0).contains(&x) => x, _ => { alert("Enter a number of seconds between 0.3 and 3600."); return; } };
+    let cfg = DeadCfg { min_frames: (secs * fps as f64).round() as u32, pad_frames: (fps / 5).max(1), ..DeadCfg::default() };
+    spawn_job(app, ui, "Finding dead air", move |pg, cc| {
+        find_dead_air(&src, &edit, cfg, pg, cc).map(|ranges| JobOut::DeadAir { ranges, gen })
+    });
+}
+
+fn start_compact(app: &Shared, ui: &Ui) {
+    {
+        let a = app.borrow();
+        if a.job.is_some() || a.proj.is_none() { return; }
+    }
+    let msg = "Compact project?\n\nThe recording is rewritten to hold only the frames your edit uses, so cut and\ndead-air footage stops taking disk space. It is lossless (JPEG bytes are copied),\nbut the edit is flattened, and undo history is cleared. The project is saved.";
+    if dialog::choice2_default(msg, "Cancel", "Compact", "") != Some(1) { return; }
+    let (src, edit) = { let mut a = app.borrow_mut(); a.set_playing(false); let p = a.proj.as_ref().unwrap(); (p.src.clone(), p.edit.clone()) };
+    spawn_job(app, ui, "Compacting", move |pg, _| {
+        src.compact(&edit, pg).map(|(src, before, after)| JobOut::Compact { src, before, after })
+    });
+}
+
 fn start_export(app: &Shared, ui: &Ui, kind: &'static str) {
     let (src, edit, base) = {
         let a = app.borrow();
         let Some(p) = &a.proj else { return };
-        if a.export.is_some() { return; }
+        if a.job.is_some() { return; }
         (p.src.clone(), p.edit.clone(), p.src.dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or("export".into()))
     };
     app.borrow_mut().set_playing(false);
+    let ff = if kind == "mov" || kind == "mp4" { match ensure_ffmpeg(app) { Some(p) => Some(p), None => { refresh(app, ui); return; } } } else { None };
     let (filter, ext) = match kind { "mkv" => ("Matroska\t*.mkv", "mkv"), "mov" => ("QuickTime MOV\t*.mov", "mov"), "mp4" => ("MP4\t*.mp4", "mp4"), _ => ("WAV audio\t*.wav", "wav") };
     let Some(path) = choose_file("Export", filter, Some(&format!("{base}.{ext}"))) else { return };
     let path = with_ext(path, ext);
-    let progress = Arc::new(AtomicU32::new(0));
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (pg, cc) = (progress.clone(), cancel.clone());
-    let handle = thread::spawn(move || -> Res<String> {
+    spawn_job(app, ui, &format!("Exporting {}", kind.to_uppercase()), move |pg, cc| {
         let t0 = Instant::now();
-        match kind {
-            "mkv" => export_mkv(&path, &src, &edit, &pg, &cc)?,
-            "wav" => export_wav(&path, &src, &edit)?,
-            _ => {
+        match (kind, ff) {
+            ("mkv", _) => export_mkv(&path, &src, &edit, pg, cc)?,
+            ("wav", _) => export_wav(&path, &src, &edit)?,
+            (_, Some(ff)) => {
                 let tmp = path.with_extension("srtmp.mkv");
-                export_mkv(&tmp, &src, &edit, &pg, &cc)?;
-                let r = ffmpeg_convert(&tmp, &path, kind == "mov");
+                export_mkv(&tmp, &src, &edit, pg, cc)?;
+                let r = ffmpeg_convert(&ff, &tmp, &path, kind == "mov");
                 let _ = std::fs::remove_file(&tmp);
                 r?;
             }
+            _ => return Err("ffmpeg not available".into()),
         }
-        Ok(format!("Exported {} in {:.2}s", path.display(), t0.elapsed().as_secs_f64()))
+        Ok(JobOut::Msg(format!("Exported {} in {:.2}s", path.display(), t0.elapsed().as_secs_f64())))
     });
-    let mut a = app.borrow_mut();
-    a.export = Some(ExportJob { progress, cancel, handle, label: kind.to_uppercase() });
-    a.status = format!("Exporting {}…", kind.to_uppercase());
-    drop(a);
-    refresh(app, ui);
+}
+
+/// Swap in the compacted media: flatten the edit to one Src run, clear undo, save, and
+/// delete the old media pair (best effort; the decoder may still hold it open briefly).
+fn apply_compact(a: &mut App, src: Source, before: u64, after: u64) -> String {
+    let total = src.count();
+    let Some(p) = a.proj.as_mut() else { return "Compact finished but the project was closed".into() };
+    let old = p.src.clone();
+    p.src = Arc::new(src);
+    p.edit.segs = vec![Seg::Src { start: 0, len: total }];
+    p.undo.clear(); p.redo.clear();
+    p.dirty = true;
+    let saved = p.save();
+    a.edit_gen += 1;
+    a.preview = None;
+    a.after_edit();
+    if let Err(e) = saved { return format!("Compacted, but saving failed: {e} (old media kept)"); }
+    if old.base != a.proj.as_ref().unwrap().src.base {
+        for ext in ["mjpg", "idx"] { let _ = std::fs::remove_file(old.dir.join(format!("{}.{ext}", old.base))); }
+    }
+    let mb = |b: u64| b as f64 / 1_048_576.0;
+    format!("Compacted: {:.1} MB → {:.1} MB ({:.1} MB freed)", mb(before), mb(after), mb(before.saturating_sub(after)))
 }
 
 /// UI heartbeat (~60 Hz): playback position, decoder results, export + recording status.
@@ -2408,14 +2963,28 @@ fn tick(app: &Shared, ui: &Ui) {
         }
         if err { drop(a); stop_recording(app, ui); return; }
     }
-    // Export completion
-    if let Some((pct, label, done)) = a.export.as_ref().map(|j| (j.progress.load(Relaxed) / 10, j.label.clone(), j.handle.is_finished())) {
-        let l = format!("Exporting {label}… {pct}%");
+    // Background job progress + completion
+    if let Some((pct, label, done)) = a.job.as_ref().map(|j| (j.progress.load(Relaxed) / 10, j.label.clone(), j.handle.is_finished())) {
+        let l = format!("{label}… {pct}%");
         if a.status != l && !done { a.status = l; need = true; }
         if done {
-            let j = a.export.take().unwrap();
-            let r = j.handle.join().unwrap_or_else(|_| Err("export thread panicked".into()));
-            a.status = match r { Ok(s) => s, Err(e) => format!("Export failed: {e}") };
+            let j = a.job.take().unwrap();
+            let r = j.handle.join().unwrap_or_else(|_| Err("background thread panicked".into()));
+            a.status = match r {
+                Ok(JobOut::Msg(s)) => s,
+                Ok(JobOut::DeadAir { ranges, gen }) => {
+                    let fps = a.fps() as f64;
+                    let secs: u32 = ranges.iter().map(|(x, y)| y - x).sum();
+                    let n = ranges.len();
+                    a.dead = ranges;
+                    a.dead_gen = gen; // stale if the user edited meanwhile (gen != edit_gen)
+                    if gen != a.edit_gen { "Dead-air scan discarded: the project changed while scanning".into() }
+                    else if n == 0 { "No dead air found".into() }
+                    else { format!("Found {n} dead-air region(s), {:.1}s total (red). Click \"Remove dead air\" to cut them.", secs as f64 / fps) }
+                }
+                Ok(JobOut::Compact { src, before, after }) => apply_compact(&mut a, src, before, after),
+                Err(e) => format!("{label} failed: {e}"),
+            };
             need = true;
         }
     }
@@ -2460,7 +3029,7 @@ fn tick(app: &Shared, ui: &Ui) {
 }
 
 fn build_ui(app: &Shared) -> Ui {
-    let mut win = Window::default().with_size(1180, 780).with_label(&format!("{APP_NAME} v{VERSION}"));
+    let mut win = Window::default().with_size(1180, 816).with_label(&format!("{APP_NAME} v{VERSION}"));
     win.size_range(820, 560, 0, 0);
     let mut col = Flex::default_fill().column();
     col.set_margin(6);
@@ -2493,6 +3062,8 @@ Linux: needs PulseAudio or PipeWire. Use headphones to keep speaker sound out of
 
     let mut r2 = Flex::default().row();
     r2.set_pad(4);
+    let mut new = Button::default().with_label("New");
+    new.set_tooltip("Close the current project and start fresh (Ctrl+N)");
     let open = Button::default().with_label("Open…");
     let save = Button::default().with_label("Save");
     let exp_mkv = Button::default().with_label("Export MKV (instant)");
@@ -2500,7 +3071,7 @@ Linux: needs PulseAudio or PipeWire. Use headphones to keep speaker sound out of
     let exp_mp4 = Button::default().with_label("Export MP4 (H.264, ffmpeg)");
     let exp_wav = Button::default().with_label("Export WAV mix");
     Frame::default();
-    r2.fixed(&open, 90); r2.fixed(&save, 80); r2.fixed(&exp_mkv, 160); r2.fixed(&exp_mov, 210); r2.fixed(&exp_mp4, 200); r2.fixed(&exp_wav, 120);
+    r2.fixed(&new, 70); r2.fixed(&open, 90); r2.fixed(&save, 80); r2.fixed(&exp_mkv, 160); r2.fixed(&exp_mov, 210); r2.fixed(&exp_mp4, 200); r2.fixed(&exp_wav, 120);
     r2.end();
     col.fixed(&r2, 30);
 
@@ -2545,6 +3116,29 @@ Linux: needs PulseAudio or PipeWire. Use headphones to keep speaker sound out of
     r4.end();
     col.fixed(&r4, 30);
 
+    // r5: speed-up + dead-air tools
+    let mut r5 = Flex::default().row();
+    r5.set_pad(4);
+    let speed_lbl = Frame::default().with_label("Speed:").with_align(Align::Right | Align::Inside);
+    let mut speed = Choice::default();
+    for sp in SPEEDS { speed.add_choice(&format!("{}×", fmt_speed(sp))); }
+    speed.set_value(2);
+    let mut speed_mute = CheckButton::default().with_label("Mute sped-up audio");
+    speed_mute.set_tooltip("Off: audio is time-compressed with pitch preserved (speech stays natural).\nOn: the sped-up range is silent.");
+    let mut speed_btn = Button::default().with_label("» Speed up selection");
+    speed_btn.set_tooltip("Play the selected range faster (ripple). Video frames are skipped losslessly;\naudio is compressed to match. Undo with Ctrl+Z.");
+    let mut find_dead = Button::default().with_label("Find dead air…");
+    find_dead.set_tooltip("Find stretches where every audible track is silent AND the picture does not change.\nCursor movement alone does not count as a change.");
+    let mut rm_dead = Button::default().with_label("Remove dead air");
+    rm_dead.set_tooltip("Cut all highlighted dead-air regions in one undoable step");
+    let mut compact = Button::default().with_label("Compact project…");
+    compact.set_tooltip("Rewrite the recording so it holds only frames the edit uses (frees disk space; clears undo)");
+    Frame::default();
+    r5.fixed(&speed_lbl, 50); r5.fixed(&speed, 70); r5.fixed(&speed_mute, 160); r5.fixed(&speed_btn, 170);
+    r5.fixed(&find_dead, 130); r5.fixed(&rm_dead, 170); r5.fixed(&compact, 150);
+    r5.end();
+    col.fixed(&r5, 30);
+
     let mut timeline = Frame::default();
     timeline.set_frame(FrameType::FlatBox);
     col.fixed(&timeline, 210);
@@ -2556,12 +3150,13 @@ Linux: needs PulseAudio or PipeWire. Use headphones to keep speaker sound out of
     win.make_resizable(true);
     let ui = Ui { win, rec_full, rec_region, fps, quality, half, cursor, mic, sys, open, save, exp_mkv, exp_mov, exp_mp4, exp_wav,
         preview, play, time, cut, ifreeze, fsecs, freeze_sel, undo, redo, narr, fitz, track, mute, gain, shl, shr, newt, import,
-        replace, remove, timeline, status };
+        replace, remove, timeline, status, new, speed, speed_mute, speed_btn, find_dead, rm_dead, compact };
     // Buttons should not steal Space/Enter (used as shortcuts).
     for mut b in [ui.rec_full.clone(), ui.rec_region.clone(), ui.open.clone(), ui.save.clone(), ui.exp_mkv.clone(), ui.exp_mov.clone(),
         ui.exp_mp4.clone(), ui.exp_wav.clone(), ui.play.clone(), ui.cut.clone(), ui.ifreeze.clone(), ui.freeze_sel.clone(), ui.undo.clone(),
         ui.redo.clone(), ui.narr.clone(), ui.fitz.clone(), ui.mute.clone(), ui.shl.clone(), ui.shr.clone(), ui.newt.clone(),
-        ui.import.clone(), ui.replace.clone(), ui.remove.clone()] { b.clear_visible_focus(); }
+        ui.import.clone(), ui.replace.clone(), ui.remove.clone(), ui.new.clone(), ui.speed_btn.clone(), ui.find_dead.clone(),
+        ui.rm_dead.clone(), ui.compact.clone()] { b.clear_visible_focus(); }
     ui
 }
 
@@ -2569,8 +3164,13 @@ Linux: needs PulseAudio or PipeWire. Use headphones to keep speaker sound out of
 fn handle_key(a: &Shared, u: &Ui) -> bool {
     let k = app::event_key();
     let ctrl = app::event_state().contains(Shortcut::Ctrl) || app::event_state().contains(Shortcut::Command);
+    if ctrl && k == Key::from_char('n') {
+        // Routed through the button so the unsaved-changes / busy checks live in one place.
+        if u.new.active() { u.new.clone().do_callback(); }
+        return true;
+    }
     let Ok(mut s) = a.try_borrow_mut() else { return false };
-    if s.proj.is_none() || s.export.is_some() { return false; }
+    if s.proj.is_none() || s.job.is_some() { return false; }
     if s.narr.is_some() {
         // While re-recording narration only Space/Esc (stop) are honoured.
         if k == Key::from_char(' ') || k == Key::Escape { s.set_playing(false); drop(s); refresh(a, u); return true; }
@@ -2578,7 +3178,23 @@ fn handle_key(a: &Shared, u: &Ui) -> bool {
     }
     let r: Res<()> = match (ctrl, k) {
         (false, Key::Delete) | (false, Key::BackSpace) => s.op_cut(),
-        (false, k) if k == Key::from_char(' ') => { let p = !s.play.playing.load(Relaxed); s.set_playing(p); Ok(()) }
+        (true, k) if k == Key::from_char('x') => s.op_cut(),
+        (false, k) if k == Key::from_char(' ') => {
+            // Double-tap Space (< 400 ms): jump to 0 and restore the play state from before
+            // the first tap (so playing stays playing from the start, paused stays paused).
+            let was = s.play.playing.load(Relaxed);
+            match s.space_at.take() {
+                Some((t, before)) if t.elapsed() < Duration::from_millis(400) => {
+                    s.set_playing(false);
+                    s.seek(0);
+                    s.scroll = 0.0;
+                    if before { s.set_playing(true); }
+                    s.status = "Back to start".into();
+                }
+                _ => { s.space_at = Some((Instant::now(), was)); s.set_playing(!was); }
+            }
+            Ok(())
+        }
         (false, k) if k == Key::from_char('f') => { let v = u.fsecs.value(); s.op_insert_freeze(v) }
         (true, k) if k == Key::from_char('z') => { s.op_undo(false); Ok(()) }
         (true, k) if k == Key::from_char('y') => { s.op_undo(true); Ok(()) }
@@ -2621,7 +3237,7 @@ fn wire(app: &Shared, ui: &Ui) {
             } else if s.proj.is_none() {
                 draw::set_draw_color(Color::from_rgb(150, 150, 150));
                 draw::set_font(Font::Helvetica, 16);
-                draw::draw_text2(&format!("{APP_NAME} v{VERSION}\n\n● Record Screen / ● Record Region to begin\n\nSpace play/pause · Del cut · F insert freeze · Ctrl+Z/Y undo/redo · Ctrl+S save"),
+                draw::draw_text2(&format!("{APP_NAME} v{VERSION}\n\n● Record Screen / ● Record Region to begin\n\nSpace play/pause · Space Space back to 0 · Del/Ctrl+X cut · F insert freeze\nCtrl+Z/Y undo/redo · Ctrl+S save · Ctrl+N new"),
                     f.x(), f.y(), f.w(), f.h(), Align::Center);
             }
         });
@@ -2641,7 +3257,7 @@ fn wire(app: &Shared, ui: &Ui) {
                 _ => {}
             }
             let Ok(mut s) = a.try_borrow_mut() else { return false };
-            if s.proj.is_none() || s.export.is_some() { return false; }
+            if s.proj.is_none() || s.job.is_some() { return false; }
             let (ex, ey) = (app::event_x(), app::event_y());
             match ev {
                 Event::Push => {
@@ -2715,19 +3331,21 @@ fn wire(app: &Shared, ui: &Ui) {
         }
     });
     // File ops
+    cb!(ui.new, |a, u| {
+        if !may_close_project(a) { return; }
+        a.borrow_mut().set_project(None, u.timeline.w());
+        a.borrow_mut().status = "New project: press ● Record Screen or ● Record Region".into();
+    });
     cb!(ui.open, |a, u| {
+        if !may_close_project(a) { return; }
         if let Some(p) = choose_file("Open ScreenReel project (project.txt)", "ScreenReel project\tproject.txt", None) {
             a.borrow_mut().set_playing(false);
             match Project::load(&p) {
                 Ok(pr) => {
+                    let msg = format!("Opened {}", pr.src.dir.display());
                     let mut s = a.borrow_mut();
-                    let n = pr.edit.total();
-                    s.status = format!("Opened {}", pr.src.dir.display());
-                    s.proj = Some(pr);
-                    s.sel = None; s.sel_track = None; s.scroll = 0.0;
-                    s.zoom = (u.timeline.w() as f64 / n.max(1) as f64).max(1e-4);
-                    s.after_edit();
-                    s.seek(0);
+                    s.set_project(Some(pr), u.timeline.w());
+                    s.status = msg;
                 }
                 Err(e) => alert(&format!("Open failed:\n{e}")),
             }
@@ -2749,6 +3367,15 @@ fn wire(app: &Shared, ui: &Ui) {
     cb!(ui.freeze_sel, |a, u| { let r = a.borrow_mut().op_freeze_sel(); report(a, r); });
     cb!(ui.undo, |a, u| { a.borrow_mut().op_undo(false); });
     cb!(ui.redo, |a, u| { a.borrow_mut().op_undo(true); });
+    cb!(ui.speed_btn, |a, u| {
+        let sp = SPEEDS.get(u.speed.value().max(0) as usize).copied().unwrap_or(200);
+        let mute = u.speed_mute.is_checked();
+        let r = a.borrow_mut().op_speed(sp, mute);
+        report(a, r);
+    });
+    cb!(ui.find_dead, |a, u| { start_dead_scan(a, u); });
+    cb!(ui.rm_dead, |a, u| { let r = a.borrow_mut().op_remove_dead(); report(a, r); });
+    cb!(ui.compact, |a, u| { start_compact(a, u); });
     cb!(ui.fitz, |a, u| { let mut s = a.borrow_mut(); s.scroll = 0.0; s.zoom = (u.timeline.w() as f64 / s.total().max(1) as f64).max(1e-4); });
     cb!(ui.narr, |a, u| {
         let mic = { let s = a.borrow(); match u.mic.value() { i if i >= 2 => s.mics.get(i as usize - 2).cloned(), _ => None } };
@@ -2765,6 +3392,7 @@ fn wire(app: &Shared, ui: &Ui) {
             let v = g.value() as f32;
             let mut s = a.borrow_mut();
             if let (Some(ti), Some(p)) = (s.sel_track, s.proj.as_mut()) { if let Some(t) = p.edit.tracks.get_mut(ti) { t.gain = v; p.dirty = true; } }
+            s.edit_gen += 1; // the audible mix changed: dead-air results no longer apply
             s.sync_mix();
             drop(s);
             let mut tl = u.timeline.clone(); tl.redraw();
@@ -2815,9 +3443,9 @@ fn wire(app: &Shared, ui: &Ui) {
         w.set_callback(move |w| {
             if app::event() != Event::Close { return; }
             let dirty = a2.borrow().proj.as_ref().map(|p| p.dirty).unwrap_or(false);
-            if a2.borrow().export.is_some() {
-                if dialog::choice2_default("An export is running. Cancel it and quit?", "Keep working", "Quit", "") != Some(1) { return; }
-                if let Some(j) = &a2.borrow().export { j.cancel.store(true, Relaxed); }
+            if a2.borrow().job.is_some() {
+                if dialog::choice2_default("A background job (export/scan/compact) is running. Cancel it and quit?", "Keep working", "Quit", "") != Some(1) { return; }
+                if let Some(j) = &a2.borrow().job { j.cancel.store(true, Relaxed); }
             }
             if dirty {
                 match dialog::choice2_default("Save changes to the project before quitting?", "Cancel", "Save", "Don't save") {
@@ -2880,11 +3508,73 @@ fn selftest(out: &Path, secs: f64, full: bool, sys: bool) -> Res<()> {
     e.shift_track(0, 2, spf);
     e.shift_track(0, -2, spf);
     assert_eq!(e.tracks[0].frames(), (n as usize + 20) * spf);
+    // --- v1.2.0: WSOLA keeps exact length and pitch (zero-crossing rate of the 440 Hz tone)
+    {
+        let x: Vec<i16> = (0..AR as usize * 2).map(|i| ((i as f32 * 440.0 * std::f32::consts::TAU / AR as f32).sin() * 8000.0) as i16).collect();
+        let y = time_stretch(&x, 1, AR as usize); // 2x
+        assert_eq!(y.len(), AR as usize);
+        let zc = y.windows(2).filter(|w| (w[0] < 0) != (w[1] < 0)).count() as f64 / 2.0; // Hz over 1 s
+        println!("time_stretch 2x: {} samples, ~{zc:.0} Hz (want ~440)", y.len());
+        assert!((400.0..480.0).contains(&zc), "pitch not preserved: {zc} Hz");
+        let big: Vec<i16> = (0..AR as usize * 60 * 2).map(|i| ((i as f32 * 0.013).sin() * 9000.0) as i16).collect();
+        let t = Instant::now();
+        let z = time_stretch(&big, 2, AR as usize * 30);
+        assert_eq!(z.len(), AR as usize * 60);
+        println!("time_stretch 60 s stereo -> 30 s in {:.3}s", t.elapsed().as_secs_f64());
+    }
+    // --- v1.2.0: speed-up of a range (ripple), Fast seg mapping + save/load round trip
+    let before_speed = e.total();
+    let a0 = 3u32;
+    let b0 = (a0 + 40).min(before_speed);
+    let end = e.speed_range(a0, b0, 200, false, spf);
+    // each segment piece rounds up independently, so allow one extra frame per piece
+    assert!(end - a0 >= (b0 - a0) / 2 && end - a0 <= (b0 - a0) / 2 + 4, "2x speed must ~halve the range: {}", end - a0);
+    assert_eq!(e.total(), before_speed - (b0 - a0) + (end - a0));
+    for t in &e.tracks { assert_eq!(t.frames(), e.total() as usize * spf, "track length after speed-up"); }
+    assert!(e.segs.iter().any(|s| matches!(s, Seg::Fast { .. })), "expected a Fast segment");
+    for f in 0..e.total() { assert!(e.src_frame(f).map(|x| x < n).unwrap_or(false), "speed-up frame {f} out of range"); }
+    // splitting a Fast segment must not change the frame mapping
+    let map0: Vec<Option<u32>> = (0..e.total()).map(|f| e.src_frame(f)).collect();
+    let k = e.split(a0 + 5); let _ = k; e.normalize();
+    assert_eq!(map0, (0..e.total()).map(|f| e.src_frame(f)).collect::<Vec<_>>(), "split/normalize changed Fast mapping");
+    // --- v1.2.0: dead air. Silence a tone stretch; the Xvfb screen is static, so it must be found.
+    {
+        let mut d = Edit { segs: vec![Seg::Src { start: 0, len: n }], tracks: vec![] };
+        let (q0, q1) = (n / 4, n / 4 + (n / 2).max(1));
+        let tone: Vec<i16> = (0..n as usize * spf).map(|i| {
+            let f = (i / spf) as u32;
+            if f >= q0 && f < q1 { 0 } else { ((i as f32 * 440.0 * std::f32::consts::TAU / AR as f32).sin() * 8000.0) as i16 }
+        }).collect();
+        d.tracks.push(Track { name: "T".into(), ch: 1, data: Arc::new(tone), gain: 1.0, muted: false });
+        let cfg = DeadCfg { min_frames: fps / 2, pad_frames: 2, ..DeadCfg::default() };
+        let t2 = Instant::now();
+        let r = find_dead_air(&src, &d, cfg, &AtomicU32::new(0), &AtomicBool::new(false))?;
+        println!("dead air: {r:?} (silence {q0}..{q1}) in {:.3}s", t2.elapsed().as_secs_f64());
+        if !full {
+            // region capture of a static Xvfb root: exactly one range inside the silence
+            assert_eq!(r.len(), 1, "expected one dead-air range");
+            assert!(r[0].0 >= q0 && r[0].1 <= q1 && r[0].1 - r[0].0 >= (q1 - q0) / 2, "dead-air range misplaced");
+            let tot = d.total();
+            d.cut_many(&r, spf);
+            assert_eq!(d.total(), tot - (r[0].1 - r[0].0));
+            assert_eq!(d.tracks[0].frames(), d.total() as usize * spf);
+        }
+    }
     let mut p = Project { src: src.clone(), edit: e.clone(), undo: vec![], redo: vec![], dirty: true };
     p.save()?;
     let p2 = Project::load(&dir)?;
     assert_eq!(p2.edit.segs, p.edit.segs);
     assert_eq!(p2.edit.tracks[0].data.len(), p.edit.tracks[0].data.len());
+    // --- v1.2.0: compaction keeps every output frame byte-identical
+    {
+        let (cs, before, after) = p2.src.compact(&p2.edit, &AtomicU32::new(0))?;
+        assert_eq!(cs.count(), p2.edit.total());
+        for f in (0..p2.edit.total()).step_by(7) {
+            assert_eq!(cs.read(f)?, p2.src.read(p2.edit.src_frame(f).unwrap())?, "compacted frame {f} differs");
+        }
+        println!("compact: {before} -> {after} bytes, {} index entries", cs.count());
+        for ext in ["mjpg", "idx"] { let _ = std::fs::remove_file(dir.join(format!("{}.{ext}", cs.base))); }
+    }
     let mkv = out.join("selftest.mkv");
     let t1 = Instant::now();
     export_mkv(&mkv, &src, &p2.edit, &AtomicU32::new(0), &AtomicBool::new(false))?;
@@ -2934,10 +3624,11 @@ fn main() {
     let (out, out_err) = match start_output(play.clone()) { Ok(s) => (Some(s), None), Err(e) => (None, Some(e)) };
     let app_state: Shared = std::rc::Rc::new(std::cell::RefCell::new(App {
         proj: None, play, out, clock: None, playhead: 0, sel: None, sel_track: None, zoom: 1.0, scroll: 0.0, drag_anchor: None,
-        peaks: HashMap::new(), rec: None, rec_pending: false, ctl: None, narr: None, dec: Decoder::new(), preview: None, export: None,
+        peaks: HashMap::new(), rec: None, rec_pending: false, ctl: None, narr: None, dec: Decoder::new(), preview: None, job: None,
+        edit_gen: 0, dead: Vec::new(), dead_gen: u64::MAX, space_at: None,
         mics: input_device_names(),
         status: match out_err { Some(e) => format!("Ready (no audio output: {e}; preview is silent)"), None => "Ready".into() },
-        ffmpeg: ffmpeg_available(),
+        ffmpeg: find_ffmpeg(),
     }));
     let ui = build_ui(&app_state);
     wire(&app_state, &ui);
