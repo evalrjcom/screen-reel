@@ -1,13 +1,13 @@
-# ScreenReel v1.3.1 — User & Developer Guide
+# ScreenReel v1.4.0 — User & Developer Guide
 
 ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written in Rust and FLTK. It builds as a single binary for Linux and Windows.
 
 | | |
 |---|---|
-| Source | `screenreel_v1.3.1.rs` (single file, about 4,650 lines) |
-| Build helper | `build_screenreel_v1.3.1.sh` |
-| CI | `.github/workflows/screenreel_v1.3.1.yml` |
-| Binary size | about 4.1–4.7 MB (Linux, stripped, LTO) |
+| Source | `screenreel_v1.4.0.rs` (single file, about 7,700 lines) plus `assets/` (embedded font) |
+| Build helper | `build_screenreel_v1.4.0.sh` |
+| CI | `.github/workflows/screenreel_v1.4.0.yml` |
+| Binary size | about 6.5 MB (Linux, stripped, LTO; the noise-reduction model and the annotation font account for most of the growth since v1.3) |
 
 ---
 
@@ -17,6 +17,7 @@ ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written 
 |---|---|
 | Record the full screen or a region | X11 MIT-SHM capture on Linux (falls back to XGetImage). GDI BitBlt on Windows. The cursor is composited into the video. |
 | Microphone | Records directly into a **Mic** track that is sample-aligned to the video. |
+| Live voice FX (v1.4.0) | Optional. Noise reduction (RNNoise-style), a noise gate, a voice EQ preset, a de-esser and the opto compressor run on the mic **while you record**, so the take is already polished. The same chain is available afterwards as **Voice FX…** on any track. |
 | System audio | Optional. Records what the computer is playing (a video, a browser tab, an app) into its own stereo **System** track, alongside the mic. Mute, swap, cut or re-level each track on its own. |
 | Visual timeline | Ruler, video lane (blue = recorded, orange = FREEZE, green = sped up, labelled "2×" etc.) and one waveform lane per audio track. Includes selection, playhead, zoom and scroll. Dead-air candidates show in red. |
 | Cut | Ripple-deletes the selection from the video and from every audio track. |
@@ -25,13 +26,18 @@ ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written 
 | Opto compressor | Warm, CL 1B-style optical compressor for the mic (or any track). It has presets, a live transfer curve and A/B audition on the video before you apply. |
 | Normalize levels | Brings every track to the same loudness (ITU-R BS.1770 LUFS, e.g. −16 LUFS for voice). A look-ahead limiter keeps peaks under −1 dBFS. |
 | Level meter | Stereo output peak meter with peak hold, next to the time display. |
+| Auto-duck (v1.4.0) | Lowers a music or system-audio track automatically while you speak, with smooth attack and release. |
+| Webcam overlay (v1.4.0) | Records a webcam alongside the screen and shows it picture-in-picture: circle, rounded or square, any corner, adjustable size, optional background blur and mirroring. |
+| Cursor effects and auto zoom (v1.4.0) | Records where the pointer is, when you click and when you type (never which key). Adds click rings, a cursor highlight, and **Auto zoom**, which zooms and pans smoothly to where you click and type. |
+| Annotations (v1.4.0) | Text callouts, arrows, blur and pixelate boxes (hide passwords and keys), numbered step markers and manual zoom regions. Drawn directly on the preview, timed on the timeline, undoable. |
+| Autosave and crash recovery (v1.4.0) | Unsaved edits are autosaved every 60 s. A recording interrupted by a crash or power cut is recovered on next start. |
 | Speed up selection | Plays the selected range 1.25× to 16× faster. Video skips frames losslessly. Audio is time-compressed with its pitch kept (WSOLA), or muted if you prefer. |
 | Find / remove dead air | Finds stretches where every audible track is silent **and** the picture doesn't change, highlights them, and cuts them all in one undoable step. |
 | Compact project | Rewrites the recording so it keeps only the frames your edit uses. Cut footage and dead air stop taking disk space. |
 | Narration re-record | Plays the video and records the mic over the selection (or from the playhead to the end), replacing that part of the track. |
 | Audio tracks | Add, swap, remove, mute, set gain (0–200 %) and nudge by ±1 frame. Imports WAV, MP3, FLAC, OGG, M4A/AAC and the audio from MP4, MKV or MOV files. |
-| Export | **MKV**: instant, no video re-encode. **MOV**: lossless remux through ffmpeg. **MP4**: H.264 re-encode through ffmpeg. **WAV**: the audio mix. |
-| Projects | **New**, **Open…** and **Save**. Saved as a folder you can reopen. Undo/redo keeps 64 steps. |
+| Export | **MKV**: instant, no video re-encode. **MOV**: lossless remux through ffmpeg. **MP4**: H.264 re-encode through ffmpeg, on the GPU when available. **WAV**: the audio mix. |
+| Projects | **New**, **Open…** and **Save**. Saved as a folder you can reopen. Undo/redo keeps up to 64 steps (fewer on very long tracks; see §8). |
 
 ### Why edits and exports never re-encode the video
 
@@ -42,14 +48,16 @@ That gives you:
 - frame-accurate cuts, with no GOP or keyframe snapping
 - exports that run at disk speed (5.7 s of 1080p30 exported in about 25 ms in testing)
 
+**Effects (v1.4.0)** keep this property wherever they aren't used. Annotations, click rings, zoom and the webcam overlay are drawn only on the frames they touch; those frames are re-encoded once at export (quality 90, 4:4:4), and every other frame is still copied byte for byte. The webcam overlay and the cursor highlight touch every frame while they're on, so with either enabled the whole video is re-encoded at export (in parallel on all cores).
+
 Audio is 48 kHz 16-bit PCM throughout. Mixing tracks for export is plain sample arithmetic, never a lossy codec. The only lossy step is the JPEG quality you choose at capture time.
 
 ---
 
 ## 2. Quick start
 
-1. Run the binary (`screenreel_v1.3.1-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.3.1-windows-x86_64.exe`).
-2. Pick an fps, a quality and a microphone in the **RECORD** row under the preview. Tick **System audio** to also record what the computer plays.
+1. Run the binary (`screenreel_v1.4.0-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.4.0-windows-x86_64.exe`).
+2. Pick an fps, a quality and (optionally) a **Webcam** in the **RECORD** row, and a microphone in the **AUDIO IN** row. Tick **System audio** to also record what the computer plays, and **Live voice FX** to clean up the mic as you record.
 3. Click **● Record Screen**, or **● Record Region** and drag a rectangle (Esc or right-click cancels).
 4. After a 3-2-1 countdown, a small **REC** bar shows elapsed time with **|| Pause** and **■ Stop**.
 5. Click **■ Stop**. The recording opens in the editor and is already saved as a project in `~/Videos/ScreenReel/rec_YYYYMMDD_HHMMSS/` (`%USERPROFILE%\Videos\ScreenReel\…` on Windows; the timestamp is in UTC).
@@ -65,6 +73,8 @@ Audio is 48 kHz 16-bit PCM throughout. Mixing tracks for export is plain sample 
 | Cursor | Composites the mouse pointer into the video. |
 | Mic | Off, the system default, or a named input device. |
 | System audio | Also record the computer's sound output (loopback) to a separate stereo **System** track. |
+| Webcam | Off or a camera. Recorded at up to 640×480 next to the screen (`frames.cam.*`); shown as picture-in-picture, adjustable afterwards under **Effects…**. |
+| Live voice FX | Runs the saved voice chain on the mic while recording (set it up under **Voice FX… → Save for live recording**). |
 
 ### Recording system audio with the mic
 
@@ -92,15 +102,17 @@ If the encoders can't keep up, a frame is duplicated rather than letting audio d
 
 ### The control dock
 
-All controls sit in one dock under the video preview. The preview takes the rest of the window. There are five labelled rows, ordered by when you use them:
+All controls sit in one dock under the video preview. The preview takes the rest of the window. There are seven labelled rows, ordered by when you use them:
 
 | Row | Contains |
 |---|---|
-| **RECORD** | ● Record Screen, ● Record Region, fps, quality, Half-res, Cursor, mic, System audio |
+| **RECORD** | ● Record Screen, ● Record Region, fps, quality, Half-res, Cursor, Webcam |
+| **AUDIO IN** | mic, System audio, Live voice FX |
 | **PROJECT · EXPORT** | New, Open…, Save, then MKV · instant, MOV · lossless, MP4 · H.264, WAV · audio mix |
 | **PLAY · EDIT** | ▶ Play, time, level meter, Cut, Insert freeze (+ seconds), Freeze sel., Undo, Redo, ● Narrate, ⇔ Fit |
-| **TRACK** | track picker, Mute, gain, ±1 frame nudge, + Track, + Audio file…, Swap…, × Remove, **Opto compressor…** |
-| **TOOLS** | **Normalize levels…**, Speed (picker, Mute audio, » Speed up sel.), Find dead air…, Remove dead air, Compact… |
+| **TRACK** | track picker, Mute, gain, ±1 frame nudge, + Track, + Audio file…, Swap…, × Remove, **Opto compressor…**, **Voice FX…** |
+| **TOOLS** | **Normalize levels…**, **Auto-duck…**, Speed (picker, Mute audio, » Speed up sel.), Find dead air…, Remove dead air, Compact… |
+| **ANNOTATE** | tools (Select, Text, Arrow, Blur, Pixelate, Step, Zoom), colour, Delete, Edit text…, Time = selection, **Auto zoom**, **Effects…** |
 
 Colour carries meaning: red records, green plays, blue exports or applies, amber is audio FX. Every control has a fixed width with a spacer at the end of its row, so nothing stretches into giant buttons on wide monitors. Every button has a tooltip showing its shortcut. Unavailable actions are dimmed rather than hidden, so the layout never jumps. The whole app uses one dark theme that matches the timeline and video.
 
@@ -130,7 +142,70 @@ These work when the timeline or window has focus.
 | Home / End | Jump to start / end |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+S | Save the project |
-| Esc | Clear the selection, or stop narration |
+| Esc | Clear the selection (and the selected annotation), or stop narration |
+| Del (with an annotation selected) | Delete that annotation |
+
+### Live voice chain and Voice FX (v1.4.0)
+
+**Voice FX…** (TRACK row) opens the voice chain. It runs in this order:
+
+| Stage | What it does |
+|---|---|
+| EQ | A high-pass (70–90 Hz) plus shelving and bell filters for each preset: *Voice clarity*, *Warm broadcast* or *Bright (dull mic fix)*. Runs first so noise reduction gets rumble-free input. |
+| Noise reduction | RNNoise (the `nnnoiseless` Rust port): a small recurrent network that removes fans, hum and keyboard hiss while keeping speech. About 11 dB on white noise in testing. |
+| Gate | A downward expander (−30 dB floor, 6 dB hysteresis, 120 ms hold), not a hard mute, so breaths and room tone don't pump. |
+| De-esser | Detects sibilance in the high band and turns the voice down for the few milliseconds an "s" lasts, only when that band dominates (so bright vowels are left alone). It uses wideband gain to avoid the phase smearing of a filter-split de-esser. |
+| Compressor | Any opto compressor preset (see below), or off. |
+
+**Apply** processes the selected track (one undo step, runs in the background). **Save for live recording** stores the chain (`~/.config/screenreel/voice_fx`, `%APPDATA%\ScreenReel\voice_fx`) and ticks **Live voice FX**, so the next recording's mic track comes out already processed. The live chain runs on the audio sink thread at well over 100× real time on one core, so it doesn't affect capture. Noise reduction adds 10 ms of delay, which is compensated: the processed track stays sample-aligned with the video.
+
+Live processing is permanent for that take. If you want to keep the raw mic, leave **Live voice FX** off and apply **Voice FX…** after recording instead.
+
+### Auto-duck (v1.4.0)
+
+**Auto-duck…** (TOOLS row) lowers one track (usually **System** or music) whenever another (usually **Mic**) has speech. You set the depth (3–30 dB, default 12) and the voice threshold (default −40 dBFS). The gain moves on a 10 ms envelope with 80 ms attack, 300 ms hold and 600 ms release, so the music comes back smoothly between sentences. One undo step.
+
+### Annotations (v1.4.0)
+
+Pick a tool in the **ANNOTATE** row and drag on the preview:
+
+| Tool | Result |
+|---|---|
+| Text | A callout box (rounded, contrasting text colour). Click without dragging for a default-size box; double-click an existing one to edit its text. |
+| Arrow | An arrow from where you press to where you release. |
+| Blur / Pixelate | Hides what's underneath, e.g. passwords, API keys or e-mail addresses. |
+| Step | A numbered circle (1, 2, 3…) for step-by-step tutorials. |
+| Zoom | Zooms the video into the box you drew, with a smooth 0.5 s ease in and out. |
+
+New annotations last for the timeline selection, or 4 s from the playhead if nothing is selected. **Time = selection** retimes the selected annotation; the coloured bars under the video lane show when each one is on screen (click one to select it). With **Select**, drag an annotation to move it or its corner handle to resize it. Annotations move with the picture when you cut, insert freezes or speed up ranges, and are removed when their whole span is cut. They are clipped to the video frame.
+
+### Cursor, clicks and auto zoom (v1.4.0)
+
+While recording, ScreenReel stores per frame where the pointer is, whether a mouse button went down and whether any key was pressed (`frames.ev`, 5 bytes per frame). **It never records which key.** Modifier keys alone (Shift, Ctrl, Alt) don't count as typing.
+
+- **Click rings:** blue for left clicks, orange for right clicks, expanding for half a second.
+- **Cursor highlight:** a soft yellow spotlight around the pointer.
+- **Auto zoom:** creates zoom annotations around clusters of clicks and typing, following the pointer smoothly. Each one is an ordinary annotation, so you can delete, retime or resize it.
+
+Turn rings and the highlight on or off under **Effects…**. Clicks are sampled at 125 Hz, which catches every normal click (people hold a button for 60–150 ms); clicks generated by software in under 8 ms can be missed.
+
+### Webcam picture-in-picture (v1.4.0)
+
+Choose a camera in the RECORD row before recording. Under **Effects…** you can show or hide it and set the corner, size (10–45 % of the width), shape (circle, rounded, square), **background blur** and **mirror**. Changes are undoable and affect only export and preview; the camera recording itself isn't changed.
+
+Background blur keeps a soft oval for the head and shoulders sharp and blurs the rest. It is a fixed shape, not person segmentation, so it works best when you sit centred in the frame.
+
+| Platform | Camera API |
+|---|---|
+| Linux | V4L2 (`/dev/video*`), MJPEG, falling back to YUYV. 64-bit builds only. |
+| Windows | Media Foundation. |
+
+If the camera can't be opened, recording continues without it and the status line says why.
+
+### Autosave and crash recovery (v1.4.0)
+
+- **Autosave:** every 60 s, unsaved edits are written in the background to `project.autosave.txt` (plus `autosave_track_N.wav` for changed tracks). Your real save files are never touched. When you open a project with a newer autosave, ScreenReel offers to restore it. Saving, or choosing **Don't save** when closing, removes the autosave.
+- **Recording recovery:** during a recording, video and its index are flushed to disk about once a second, and mic and system audio are written to `mic.raw` / `sys.raw` as they arrive. If ScreenReel or the computer crashes, the next start offers to recover the recording. A partly written last frame is dropped, and audio is fitted to the frames that survived.
 
 ### Narration (ScreenPal-style re-record)
 
@@ -239,8 +314,22 @@ It is lossless: the JPEG bytes are copied. The edit is flattened to one blue seg
 |---|---|---|---|
 | MKV · instant | Matroska with `V_MJPEG` + `A_PCM/INT/LIT` 48 kHz stereo, 1-second clusters and cues (seekable) | **None** | nothing |
 | MOV · lossless | QuickTime container, same streams, via `ffmpeg -c copy` | **None** | ffmpeg |
-| MP4 · H.264 | H.264 CRF 18 + AAC 192k, faststart, for upload sites | Yes (labelled) | ffmpeg |
+| MP4 · H.264 | H.264 at about CRF 18 quality + AAC 192k, faststart, for upload sites. Uses the GPU encoder when one works (see below) | Yes (labelled) | ffmpeg |
 | WAV · audio mix | 48 kHz stereo 16-bit mix of all unmuted tracks | n/a | nothing |
+
+### GPU encoding for MP4 (v1.4.0)
+
+On the first MP4 export, ScreenReel checks which H.264 encoders your ffmpeg offers and test-encodes 0.3 s with each in turn (10 s limit per test), then uses the first that works for the rest of the session:
+
+| Order | Encoder | Hardware |
+|---|---|---|
+| 1 | `h264_nvenc` | NVIDIA |
+| 2 | `h264_qsv` | Intel Quick Sync |
+| 3 | `h264_amf` | AMD (Windows) |
+| 4 | `h264_vaapi` | Intel/AMD on Linux, via `/dev/dri/renderD128` |
+| 5 | `libx264` | CPU (always the fallback) |
+
+If a GPU encode fails part-way (driver reset, out of GPU memory), the export is retried once with libx264, so you still get a file. The status line names the encoder used. Set `SCREENREEL_ENCODER=libx264` (or one of the names above) to force a choice.
 
 ### Getting ffmpeg for MOV/MP4
 
@@ -276,7 +365,20 @@ rec_20261125_193739/
                     seg=F start len sp ph     sped up: output k shows start + (ph+k)*sp/100 (sp = speed×100)
                     media=frames              media pair name (frames_cN after Compact project)
   track_N.wav     48 kHz PCM per track (mono or stereo)
+  frames.ev       v1.4.0, 5 bytes per frame: i16 x, i16 y (pointer), u8 flags
+                    (1 left down, 2 right down, 4 click started, 8 key typed, 16 pointer visible)
+  frames.cam.mjpg v1.4.0, webcam JPEGs (each distinct frame stored once)
+  frames.cam.idx  v1.4.0, 12 bytes per screen frame; length 0 = no camera frame yet
+  project.txt     v1.4.0 keys:
+                    fx=cursor_hl click_rings cam_show cam_pos cam_size cam_shape cam_blur cam_mirror
+                    ov=K start end x y w h rrggbb[|text]   one per annotation; K = T text, A arrow,
+                      B blur, P pixelate, S step (+ n), Z zoom (+ scale follow). x/y/w/h are fractions
+                      of the frame; text escapes \n and \\.
+  project.autosave.txt, autosave_track_N.wav   v1.4.0 autosave (removed on Save)
+  rec.txt, mic.raw, sys.raw                    v1.4.0, present only while recording (crash recovery)
 ```
+
+The `.ev` and `.cam.*` files are optional: projects from v1.3 and earlier open unchanged, just without cursor effects or webcam.
 
 **Saving (v1.3.1):** changed tracks are first written as `track_N.wav.new`, then `project.txt.tmp` is written. The staged tracks are promoted, `project.txt` is swapped atomically, and stale files are removed only after that. A failed or interrupted save leaves the previous save loadable. Tracks whose audio hasn't changed since the last save or load are not rewritten, so Ctrl+S is near-instant on long projects. Project files with a non-finite gain (`NaN`, `inf`) or more than 64 tracks are rejected.
 
@@ -313,14 +415,14 @@ Rust, FLTK, the JPEG code and ALSA are all linked in. Only the system X11, fontc
 ```sh
 sudo apt install cmake ninja-build g++ pkg-config autoconf automake libtool \
   libx11-dev libxext-dev libxinerama-dev libxcursor-dev libxrender-dev libxfixes-dev libxft-dev libfontconfig1-dev
-./build_screenreel_v1.3.1.sh native            # -> dist/screenreel_v1.3.1-linux-x86_64-glibc
-./build_screenreel_v1.3.1.sh selftest dist/screenreel_v1.3.1-linux-x86_64-glibc
+./build_screenreel_v1.4.0.sh native            # -> dist/screenreel_v1.4.0-linux-x86_64-glibc
+./build_screenreel_v1.4.0.sh selftest dist/screenreel_v1.4.0-linux-x86_64-glibc
 ```
 
 ### Fully static Linux (musl)
 
 ```sh
-./build_screenreel_v1.3.1.sh linux-static      # needs podman or docker; builds inside alpine:3.20
+./build_screenreel_v1.4.0.sh linux-static      # needs podman or docker; builds inside alpine:3.20
 ```
 
 The script:
@@ -334,9 +436,9 @@ The script:
 | Method | Command |
 |---|---|
 | Native (MSVC) | `set RUSTFLAGS=-C target-feature=+crt-static` then `cargo build --release`. Static CRT, so no VC++ redistributable is needed. |
-| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.3.1.sh windows` |
+| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.4.0.sh windows` |
 
-CI (`.github/workflows/screenreel_v1.3.1.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
+CI (`.github/workflows/screenreel_v1.4.0.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
 
 ### Command line
 
@@ -368,6 +470,18 @@ UI thread (FLTK) ─ 60 Hz tick: playback clock, decoder results, export progres
 preview decoder thread ─ latest-request-wins JPEG decode (zune-jpeg) + 2×2 averaged downscale
 cpal output stream ─ real-time mixer (try_lock, never blocks); playhead = the sample being heard (queued position minus device delay)
 export thread ─ Matroska muxer, cancellable, progress in permille
+               v1.4.0: per 1 s cluster, frames with effects are rendered in parallel
+               (std::thread::scope), all others byte-copied
+
+v1.4.0 additions
+audio sink thread (one per capture) ─ streaming LinRes resampler → live VoiceChain
+   → raw spill (mic.raw / sys.raw) → in-memory track
+input poller (125 Hz) ─ X11 QueryPointer + QueryKeymap / GetCursorPos + GetAsyncKeyState;
+   clicks and keys are latched between frames → WMsg::Meta before each frame
+camera thread ─ V4L2 mmap (Linux) / IMFSourceReader (Windows) → latest JPEG (Arc, id)
+writer ─ frames.mjpg/.idx + .ev + .cam.* in lockstep, flushed about once a second
+autosave thread ─ every 60 s when dirty; joined before Save
+RenderCtx ─ output→source map, zoom table, overlay list; shared by preview decoder and export
 ```
 
 **Edit model.** The edit is a `Vec<Seg>`, where `Seg` is `Src{start,len}`, `Hold{frame,len}` or `Fast{start,len,sp,ph}`, plus `Vec<Track{Arc<Vec<i16>>}>`.
@@ -492,19 +606,61 @@ This release is a full line-by-line audit of v1.3.0. Every change is marked `// 
 
 **Code quality:** `cargo clippy` reports zero warnings. The MSRV-breaking `iter::repeat_n` (needs Rust 1.82, `rust-version` is 1.79) was replaced. `--selftest` adds checks for: save skipping unchanged tracks and stale cleanup, NaN-gain rejection, cleanup after a cancelled WAV or MKV export, cancelling ffmpeg, MOV remux progress, and hour time formatting.
 
+### Audit notes (v1.4.0)
+
+**Robustness and data safety**
+- **Crash recovery:** v1.3 kept recorded audio only in memory until Stop, so a crash lost all of it and the video index tail could be torn. Audio is now written to raw spill files as it arrives, all media files are flushed about once a second (data before index), and `rec.txt` marks an unfinished recording. Recovery trims every index to whole entries that point inside the data file, drops a half-written last JPEG, fits audio to the surviving frames and saves a normal project. Tested in `--selftest` with a torn JPEG and a partial index entry.
+- **Autosave** never writes `project.txt` or `track_N.wav`, so a crash during autosave can't damage the real save. Tracks unchanged since the last save are referenced, not rewritten. Save joins a running autosave first, then removes the autosave files.
+- **Undo memory:** v1.3 kept 64 snapshots regardless of size. An edit on a 1-hour track copies about 345 MB, so 64 steps could exhaust RAM. History is now also capped at 1.5 GiB of distinct audio (shared buffers counted once). Storing undo as diffs was considered and rejected for this release: every ripple edit touches every track from the edit point onwards, so a diff is about as large as the track tail it shifts.
+
+**Correctness**
+- **Resampling:** v1.3 buffered a whole take at the device rate and resampled at Stop (a CPU and memory spike at the worst moment). A streaming linear resampler now runs in the sink thread; the result is tested for length (±2 samples per second) and frequency.
+- **Voice chain alignment:** RNNoise has one frame (10 ms) of latency; the chain trims it so the processed track stays aligned (selftest: best cross-correlation lag 0).
+- **Annotation parsing** is strict: unknown kinds, `NaN`, reversed spans, out-of-range geometry (beyond −0.5…1.5 of the frame) and bad colours are rejected. Text is escaped. At most 10,000 annotations are loaded; spans are clamped to the edit length on load.
+- **Ripple:** cut, insert freeze and speed-up remap annotation times through the same mapping as the video, so an annotation stays on the frames it was drawn on.
+- **Clicks on repeated frames:** the screen writer stores an unchanged screen as a repeated index entry. Click detection only counts the first output frame of a source frame, so held or frozen frames don't replay the same click ring, and Compact clears click/key flags on repeated frames.
+- **Drawing in the letterbox:** an annotation dragged partly outside the video is clipped to the frame; one drawn entirely outside is discarded.
+
+**Security and privacy**
+- **Typing detection** records one bit per frame, "a non-modifier key went down". Key codes are never stored, so `frames.ev` can't be used to reconstruct what was typed. The keymap query masks modifier keycodes.
+- Camera buffers are bounds-checked: a V4L2 MJPEG payload is clamped to its mapped kernel buffer, raw frames must match the negotiated size, and dimensions are capped at 8192 (cameras wider than 960 px are halved). The camera runs on its own thread and the recorder only reads the latest frame, so a camera that stalls can never stall the screen capture. A camera that doesn't deliver a first frame within 8 s is skipped and the recording continues without it.
+- GPU encoder probes run ffmpeg with an argv array (no shell), stdin closed, and a hard 10 s kill deadline. `SCREENREEL_ENCODER` only accepts known encoder names.
+
+**Performance**
+- Effects render only on affected frames: in testing, 50 of 91 frames were rendered for a mix of text, arrow, blur, pixelate, step and zoom (about 11 ms per 640×360 frame, parallel across cores); the rest stayed byte copies.
+- The live voice chain processes 60 s of mono audio in 0.53 s (about 113× real time).
+- Normalize and Compressor **Apply** now run as background jobs with progress (Compressor reuses an up-to-date audition result instantly).
+- Waveform peaks take about 14 ms per 10 minutes of stereo audio (about 85 ms per hour). That's as fast as reading a cache file, so peaks are not cached on disk.
+- Audio-device error callbacks (which can fire hundreds of times a second after a device disappears) are rate-limited in the log.
+
 ### Known limitations and roadmap
 
 - MJPEG files are larger than H.264, roughly 2–8 MB/s at 1080p30 depending on content and preset. Use Half-res or Draft for long recordings, and MP4 export for sharing.
 - Audio tracks are held in RAM: about 5.7 MB per minute for a mono track.
-- The compressor and normalization render offline (applied with undo). The compressor isn't a real-time insert on the mic while recording.
+- Live voice FX is applied to the mic as it is recorded; there is no raw copy of that take. Leave it off and use **Voice FX…** afterwards if you want to keep the original.
+- Webcam background blur is a fixed soft oval, not AI person segmentation.
+- The webcam overlay and cursor highlight make every frame re-encode at export (see §1). Annotations, click rings and zoom re-encode only the frames they touch.
+- Undo snapshots share unchanged audio, but an edit to a long track copies that track. History is therefore capped by memory (1.5 GiB of distinct audio) as well as by 64 steps.
 - Speeding up and dead-air removal operate on whole video frames (1/fps). The audio is cut on the same boundaries.
 - Compact project flattens the edit (it becomes one segment), and undo history is cleared.
 - System audio records the default output only. Choosing a specific output, or a single app's audio, is not supported yet.
-- Planned: Wayland capture through the xdg-desktop-portal/PipeWire screencast, webcam overlay, text and arrow annotations, global hotkeys, and per-app audio capture.
+- The Windows webcam and GPU encoder paths are compile-checked in CI but were not runtime-tested on Windows hardware for this release.
+- Planned: Wayland capture through the xdg-desktop-portal/PipeWire screencast, global hotkeys, per-app audio capture, and person segmentation for the webcam blur.
 
 ---
 
 ## 9. Changelog
+
+**1.4.0** (2026-11-28):
+- **Live voice FX while recording:** noise reduction (RNNoise), noise gate, voice EQ presets, de-esser and opto compressor on the mic as you record; the same chain as **Voice FX…** for any track
+- **Auto-duck:** system audio or music dips automatically under your voice
+- **Cursor effects and Auto zoom:** click rings, cursor highlight, and smooth zoom and pan that follows clicks and typing (key identity never recorded)
+- **Webcam picture-in-picture:** circle, rounded or square, any corner, adjustable size, background blur, mirror (V4L2 on Linux, Media Foundation on Windows)
+- **Annotations:** text callouts, arrows, blur and pixelate boxes, numbered steps and zoom regions, timed on the timeline and undoable
+- **GPU MP4 export:** NVENC, Quick Sync, AMF or VAAPI when available, with libx264 fallback and automatic retry
+- **Autosave** every 60 s with restore on open; **crash recovery** for interrupted recordings
+- Normalize and Compressor run in the background with progress; undo capped by memory; streaming resampler; window fits small screens
+- `--selftest` adds webcam and input streams, overlays (round trip, ripple, rendering, pixelate), cursor and webcam effects, auto zoom, effects export checked with ffmpeg, MP4 encode frame count, autosave and crash recovery
 
 **1.3.1** (2026-11-28), an audit release (details under *Audit notes (v1.3.1)*):
 - Fix: crash on Ctrl+wheel zoom over very short clips
