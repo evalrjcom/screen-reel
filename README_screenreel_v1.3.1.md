@@ -1,12 +1,12 @@
-# ScreenReel v1.3.0 — User & Developer Guide
+# ScreenReel v1.3.1 — User & Developer Guide
 
 ScreenReel is a lightweight, ScreenPal-style screen recorder and editor written in Rust and FLTK. It builds as a single binary for Linux and Windows.
 
 | | |
 |---|---|
-| Source | `screenreel_v1.3.0.rs` (single file, about 4,400 lines) |
-| Build helper | `build_screenreel_v1.3.0.sh` |
-| CI | `.github/workflows/screenreel_v1.3.0.yml` |
+| Source | `screenreel_v1.3.1.rs` (single file, about 4,650 lines) |
+| Build helper | `build_screenreel_v1.3.1.sh` |
+| CI | `.github/workflows/screenreel_v1.3.1.yml` |
 | Binary size | about 4.1–4.7 MB (Linux, stripped, LTO) |
 
 ---
@@ -48,7 +48,7 @@ Audio is 48 kHz 16-bit PCM throughout. Mixing tracks for export is plain sample 
 
 ## 2. Quick start
 
-1. Run the binary (`screenreel_v1.3.0-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.3.0-windows-x86_64.exe`).
+1. Run the binary (`screenreel_v1.3.1-linux-x86_64-static`, `...-glibc`, or `screenreel_v1.3.1-windows-x86_64.exe`).
 2. Pick an fps, a quality and a microphone in the **RECORD** row under the preview. Tick **System audio** to also record what the computer plays.
 3. Click **● Record Screen**, or **● Record Region** and drag a rectangle (Esc or right-click cancels).
 4. After a 3-2-1 countdown, a small **REC** bar shows elapsed time with **|| Pause** and **■ Stop**.
@@ -256,7 +256,9 @@ Since v1.2.0, the buttons are always clickable. ScreenReel looks for ffmpeg in t
 
 If none of these is found, clicking MOV or MP4 explains how to install ffmpeg (`winget install Gyan.FFmpeg` on Windows) and offers **Locate ffmpeg…** or **Search again**. Each candidate is checked by running `ffmpeg -version`. On Windows it runs without a console window.
 
-MKV plays in VLC, mpv, ffplay, Kdenlive, Shotcut, DaVinci Resolve and OBS. Use MP4 when a website needs H.264. Exports write to `*.part` and rename on success, so an interrupted export never leaves a truncated file under the final name.
+MKV plays in VLC, mpv, ffplay, Kdenlive, Shotcut, DaVinci Resolve and OBS. Use MP4 when a website needs H.264. Exports write to `*.part` / `*.tmp` and rename on success, so an interrupted export never leaves a truncated file under the final name. Since v1.3.1, partial files are also removed after any error, not just after Cancel.
+
+Since v1.3.1, every export (including the ffmpeg phase of MOV/MP4) shows live progress and can be cancelled: ffmpeg runs as a child process that ScreenReel stops on Cancel. WAV export streams straight to disk instead of building the whole mix in memory. ScreenReel refuses to export over the project's own files (`track_N.wav`, `project.txt`, media).
 
 ---
 
@@ -275,6 +277,8 @@ rec_20261125_193739/
                     media=frames              media pair name (frames_cN after Compact project)
   track_N.wav     48 kHz PCM per track (mono or stereo)
 ```
+
+**Saving (v1.3.1):** changed tracks are first written as `track_N.wav.new`, then `project.txt.tmp` is written. The staged tracks are promoted, `project.txt` is swapped atomically, and stale files are removed only after that. A failed or interrupted save leaves the previous save loadable. Tracks whose audio hasn't changed since the last save or load are not rewritten, so Ctrl+S is near-instant on long projects. Project files with a non-finite gain (`NaN`, `inf`) or more than 64 tracks are rejected.
 
 Open a project with **Open…** (choose `project.txt`), or pass the folder on the command line: `screenreel ~/Videos/ScreenReel/rec_…`.
 
@@ -309,14 +313,14 @@ Rust, FLTK, the JPEG code and ALSA are all linked in. Only the system X11, fontc
 ```sh
 sudo apt install cmake ninja-build g++ pkg-config autoconf automake libtool \
   libx11-dev libxext-dev libxinerama-dev libxcursor-dev libxrender-dev libxfixes-dev libxft-dev libfontconfig1-dev
-./build_screenreel_v1.3.0.sh native            # -> dist/screenreel_v1.3.0-linux-x86_64-glibc
-./build_screenreel_v1.3.0.sh selftest dist/screenreel_v1.3.0-linux-x86_64-glibc
+./build_screenreel_v1.3.1.sh native            # -> dist/screenreel_v1.3.1-linux-x86_64-glibc
+./build_screenreel_v1.3.1.sh selftest dist/screenreel_v1.3.1-linux-x86_64-glibc
 ```
 
 ### Fully static Linux (musl)
 
 ```sh
-./build_screenreel_v1.3.0.sh linux-static      # needs podman or docker; builds inside alpine:3.20
+./build_screenreel_v1.3.1.sh linux-static      # needs podman or docker; builds inside alpine:3.20
 ```
 
 The script:
@@ -330,9 +334,9 @@ The script:
 | Method | Command |
 |---|---|
 | Native (MSVC) | `set RUSTFLAGS=-C target-feature=+crt-static` then `cargo build --release`. Static CRT, so no VC++ redistributable is needed. |
-| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.3.0.sh windows` |
+| Cross-build from Linux with mingw-w64 | `./build_screenreel_v1.3.1.sh windows` |
 
-CI (`.github/workflows/screenreel_v1.3.0.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
+CI (`.github/workflows/screenreel_v1.3.1.yml`) builds all three, runs the self-test under Xvfb, and attaches binaries to a GitHub release when you push a `v*` tag.
 
 ### Command line
 
@@ -457,6 +461,37 @@ export thread ─ Matroska muxer, cancellable, progress in permille
 - The compressor is O(n), with one `log10` and one `powf` per frame: 3 s of audio takes about 6 ms, and 10 minutes about 1 s.
 - Loudness measurement is O(n) with two biquads per channel.
 
+### Audit notes (v1.3.1)
+
+This release is a full line-by-line audit of v1.3.0. Every change is marked `// v1.3.1 FIX` or `// v1.3.1 PERF` in the source.
+
+**Crashes**
+- **Ctrl+wheel zoom on very short clips:** under about 9 frames, the minimum zoom exceeded the 64× maximum, and `f64::clamp(min > max)` panicked. The minimum is now capped at the maximum.
+- **Mutex poisoning:** capture, encoder, writer, decoder and mixer locks use `unwrap_or_else(into_inner)`. A panic in one worker no longer cascades into the UI thread.
+
+**Data safety**
+- **Save ordering:** v1.3.0 deleted stale tracks and overwrote WAVs before replacing `project.txt`, so a failure in between left a project that wouldn't open. The new order is: stage, then swap, then clean up (see §5).
+- **Quitting during narration** now finalizes the take before the save prompt. Before, it was silently dropped.
+- **Quitting during a job** cancels it and waits (up to 5 s) so the job can remove partial output and stop ffmpeg.
+- **Compact** records the edit generation it started from. If the project changed meanwhile, the new media is discarded instead of being paired with a different edit, which would desync the audio.
+- Exports can't overwrite the project's own files. `.part` and `.tmp` files are removed on every error path. A failed ffmpeg run removes its truncated output.
+- Load rejects `NaN` and `inf` gains (`f32::clamp` passes NaN through, which turned the mix into NaN) and caps the number of tracks.
+
+**Correctness**
+- **`decode_audio` track pick:** `a && b || c` meant a NULL-codec stream (subtitle or attachment) with a sample rate could be chosen over real audio. It is now parenthesized.
+- **`decode_audio` sample buffer:** it is rebuilt when the stream spec changes mid-file (chained OGG, broadcast MP3), which avoids a panic or mis-interleaved frames.
+- **After a new recording,** the app resets its state like New/Open (`set_project`). Before, dead-air ranges from the previous project stayed "valid" and could be cut from the new recording.
+- **Narration:** the mic is opened before the project is modified. A mic failure no longer leaves an empty "Narration N" track, and a take is one undo step instead of two.
+- **Time labels past one hour** use `H:MM:SS.cc`. The ruler no longer slices labels at a fixed byte offset.
+
+**Efficiency**
+- Save skips unchanged tracks. It tracks them with `Weak` pointers, which hold no audio in memory and can't hit ABA pointer reuse.
+- WAV export uses O(1) memory: it streams 1 s blocks with progress and cancel. Before, the whole mix was built in RAM (about 1.4 GB for 2 hours).
+- The dead-air scan tests audio first and decodes JPEGs only during silent stretches.
+- ffmpeg progress is parsed from `-progress pipe:1`. Its pipes are drained on helper threads, so there's no pipe-buffer deadlock.
+
+**Code quality:** `cargo clippy` reports zero warnings. The MSRV-breaking `iter::repeat_n` (needs Rust 1.82, `rust-version` is 1.79) was replaced. `--selftest` adds checks for: save skipping unchanged tracks and stale cleanup, NaN-gain rejection, cleanup after a cancelled WAV or MKV export, cancelling ffmpeg, MOV remux progress, and hour time formatting.
+
 ### Known limitations and roadmap
 
 - MJPEG files are larger than H.264, roughly 2–8 MB/s at 1080p30 depending on content and preset. Use Half-res or Draft for long recordings, and MP4 export for sharing.
@@ -470,6 +505,18 @@ export thread ─ Matroska muxer, cancellable, progress in permille
 ---
 
 ## 9. Changelog
+
+**1.3.1** (2026-11-28), an audit release (details under *Audit notes (v1.3.1)*):
+- Fix: crash on Ctrl+wheel zoom over very short clips
+- Fix: an interrupted Save could leave a project that wouldn't open. Save is now crash-safe and skips unchanged tracks
+- Fix: narration lost when quitting mid-take. Background jobs are cancelled and cleaned up on quit
+- Fix: Compact applied to an edit that had changed meanwhile could desync audio. It is now discarded safely
+- Fix: stale dead-air results from the previous project stayed usable after a new recording
+- Fix: audio import could pick a non-audio stream, or panic on files whose format changes mid-stream
+- Fix: a failed mic start left an empty narration track. A narration take is now one undo step
+- Fix: exports leave no partial files on error, can't overwrite project files, and reject NaN gains on load
+- MOV/MP4: ffmpeg phase shows progress and is cancellable. WAV export streams to disk with progress and cancel
+- Faster dead-air scan. Time labels past one hour. Zero clippy warnings, and MSRV 1.79 is honoured again
 
 **1.3.0** (2026-11-27):
 - **Opto compressor** (warm CL 1B-style) for the mic or any track: soft-knee optical cell with program-dependent release and a tube warmth stage; 5 presets, live transfer curve, A/B audition on the video, one-step apply

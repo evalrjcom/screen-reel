@@ -1,5 +1,5 @@
-//! ScreenReel v1.3.0 — lightweight screen recorder + editor (Rust + FLTK)
-//! File: screenreel_v1.3.0.rs
+//! ScreenReel v1.3.1 — lightweight screen recorder + editor (Rust + FLTK)
+//! File: screenreel_v1.3.1.rs
 //!
 //! Design summary
 //! --------------
@@ -15,6 +15,18 @@
 //!
 //! Changelog
 //! ---------
+//! 1.3.1  Audit release (all changes tagged `v1.3.1 FIX` / `v1.3.1 PERF` inline). Crash fixes:
+//!        timeline Ctrl+wheel zoom on short clips (f64::clamp min>max panic), poisoned
+//!        mutexes no longer cascade panics. Data safety: crash-safe Save ordering (tracks
+//!        staged, project.txt swapped, stale files removed last), narration finalized on
+//!        quit, export temp files removed on every error path, Compact discarded if the
+//!        edit changed meanwhile, exports may not overwrite the project's own files, NaN
+//!        gains rejected on load. Correctness: decode_audio track filter precedence and
+//!        sample-buffer spec changes, recordings reset dead-air/FX state like Open/New,
+//!        narration start no longer leaves an empty track on mic failure (one undo step),
+//!        ruler labels past 1 h. Efficiency: Save skips unchanged track WAVs, WAV export
+//!        streams (O(1) memory) with progress+cancel, ffmpeg runs cancellable with live
+//!        progress, dead-air scan skips JPEG decode while audio is audible. Clippy-clean.
 //! 1.3.0  Opto compressor (CL 1B-style: soft-knee optical cell with program-dependent
 //!        release + tube make-up stage) with presets, transfer curve and A/B audition.
 //!        Normalize levels: BS.1770 gated LUFS per track to a target with a look-ahead
@@ -60,8 +72,8 @@ use fltk::{
 };
 
 // Every in-file version reference derives from these two constants (bump together).
-const VERSION: &str = "1.3.0";
-const FILE_TAG: &str = "screenreel_v1.3.0";
+const VERSION: &str = "1.3.1";
+const FILE_TAG: &str = "screenreel_v1.3.1";
 const APP_NAME: &str = "ScreenReel";
 const AR: u32 = 48_000; // canonical project audio rate
 const FPS_CHOICES: [u32; 8] = [10, 15, 20, 24, 25, 30, 50, 60]; // all divide 48000 exactly
@@ -70,6 +82,8 @@ const MAX_JPEG: u32 = 64 << 20; // sanity bound per frame when loading projects
 const MAX_AUDIO_FRAMES: usize = AR as usize * 60 * 60 * 4; // 4 h import cap (memory guard)
 
 type Res<T> = Result<T, String>;
+/// (channels, interleaved 48 kHz samples). v1.3.1: alias for clippy::type_complexity.
+type PcmTrack = (u16, Vec<i16>);
 fn es<E: std::fmt::Display>(e: E) -> String { e.to_string() }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +94,8 @@ struct Rect { x: i32, y: i32, w: i32, h: i32 }
 // =====================================================================================
 
 /// Alpha-blend a premultiplied ARGB cursor image onto a BGRA frame.
+// v1.3.1 FIX (clippy): 8 plain scalars read clearer than a one-off struct here.
+#[allow(clippy::too_many_arguments)]
 fn blend_cursor(buf: &mut [u8], w: usize, h: usize, ox: i32, oy: i32, cw: usize, ch: usize, px: &[u32]) {
     if px.len() < cw * ch { return; }
     for cy in 0..ch {
@@ -460,11 +476,26 @@ fn fit_len(v: Vec<i16>, ch: usize, target: usize) -> Vec<i16> {
 fn f2i(s: f32) -> i16 { (s.clamp(-1.0, 1.0) * 32767.0).round() as i16 }
 
 fn write_wav(path: &Path, ch: u16, rate: u32, data: &[i16]) -> Res<()> {
-    let bytes = data.len() as u64 * 2;
+    write_wav_with(path, ch, rate, data.len() as u64, |w| {
+        let mut buf = Vec::with_capacity(64 * 1024);
+        for chunk in data.chunks(32 * 1024) {
+            buf.clear();
+            for s in chunk { buf.extend_from_slice(&s.to_le_bytes()); }
+            w.write_all(&buf).map_err(es)?;
+        }
+        Ok(())
+    })
+}
+
+/// v1.3.1: streaming WAV writer. `fill` must write exactly `n_samples` i16 LE samples; the
+/// header is written up front (size known), the file is staged as `.wav.tmp` and renamed
+/// into place only on success. v1.3.0 left the `.tmp` behind on any write error.
+fn write_wav_with(path: &Path, ch: u16, rate: u32, n_samples: u64, fill: impl FnOnce(&mut BufWriter<File>) -> Res<()>) -> Res<()> {
+    let bytes = n_samples * 2;
     if bytes > (u32::MAX - 44) as u64 { return Err("WAV would exceed 4 GiB".into()); }
     let tmp = path.with_extension("wav.tmp");
-    {
-        let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp).map_err(es)?);
+    let r = (|| -> Res<()> {
+        let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?);
         let mut h = Vec::with_capacity(44);
         h.extend_from_slice(b"RIFF");
         h.extend_from_slice(&(36 + bytes as u32).to_le_bytes());
@@ -479,15 +510,29 @@ fn write_wav(path: &Path, ch: u16, rate: u32, data: &[i16]) -> Res<()> {
         h.extend_from_slice(b"data");
         h.extend_from_slice(&(bytes as u32).to_le_bytes());
         w.write_all(&h).map_err(es)?;
-        let mut buf = Vec::with_capacity(64 * 1024);
-        for chunk in data.chunks(32 * 1024) {
-            buf.clear();
-            for s in chunk { buf.extend_from_slice(&s.to_le_bytes()); }
-            w.write_all(&buf).map_err(es)?;
-        }
+        fill(&mut w)?;
         w.flush().map_err(es)?;
+        // v1.3.1 FIX: verify the producer wrote exactly what the header promised
+        let len = w.get_ref().metadata().map_err(es)?.len();
+        if len != 44 + bytes { return Err(format!("WAV size mismatch ({len} != {})", 44 + bytes)); }
+        Ok(())
+    })();
+    match r {
+        Ok(()) => std::fs::rename(&tmp, path).map_err(|e| { let _ = std::fs::remove_file(&tmp); format!("{}: {e}", path.display()) }),
+        Err(e) => { let _ = std::fs::remove_file(&tmp); Err(e) }
     }
-    std::fs::rename(&tmp, path).map_err(es)
+}
+
+/// v1.3.1: true if `path` is exactly what `write_wav(path, ch, AR, data)` with `n` samples
+/// would produce (44-byte PCM header, 48 kHz, s16, same size), so Save may skip rewriting it.
+fn wav_is_canonical(path: &Path, ch: u16, n: usize) -> bool {
+    let Ok(mut f) = File::open(path) else { return false };
+    let mut h = [0u8; 44];
+    if f.read_exact(&mut h).is_err() { return false; }
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    &h[0..4] == b"RIFF" && &h[8..16] == b"WAVEfmt " && h[20..22] == 1u16.to_le_bytes() && h[22..24] == ch.to_le_bytes()
+        && h[24..28] == AR.to_le_bytes() && h[34..36] == 16u16.to_le_bytes() && &h[36..40] == b"data"
+        && len == 44 + n as u64 * 2
 }
 
 /// Decode any supported audio (wav/mp3/flac/ogg/m4a/aac/mkv/mp4 audio) to 48 kHz i16,
@@ -503,8 +548,10 @@ fn decode_audio(path: &Path) -> Res<(u16, Vec<i16>)> {
         .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
         .map_err(|e| format!("unsupported audio file: {e}"))?;
     let mut fmt = probed.format;
-    let track = fmt.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.channels.is_some()
-        || t.codec_params.sample_rate.is_some()).ok_or("no audio track found")?;
+    // v1.3.1 FIX: `a && b || c` parsed as `(a && b) || c`, so a NULL-codec (e.g. subtitle or
+    // attachment) track that merely advertised a sample rate could be picked over real audio.
+    let track = fmt.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL
+        && (t.codec_params.channels.is_some() || t.codec_params.sample_rate.is_some())).ok_or("no audio track found")?;
     let tid = track.id;
     let mut rate = track.codec_params.sample_rate.unwrap_or(0);
     // Some demuxers (e.g. MKV with PCM) omit max_frames_per_packet, which the PCM decoder requires.
@@ -514,6 +561,7 @@ fn decode_audio(path: &Path) -> Res<(u16, Vec<i16>)> {
     let mut out_ch = 0usize;
     let mut out: Vec<i16> = Vec::new();
     let mut sb: Option<SampleBuffer<i16>> = None;
+    let mut sb_spec = None; // v1.3.1: spec the sample buffer was built for
     loop {
         let pkt = match fmt.next_packet() {
             Ok(p) => p,
@@ -528,8 +576,12 @@ fn decode_audio(path: &Path) -> Res<(u16, Vec<i16>)> {
                 if rate == 0 { rate = spec.rate; }
                 let c = spec.channels.count().max(1);
                 if out_ch == 0 { out_ch = if c >= 2 { 2 } else { 1 }; }
-                if sb.as_ref().map(|s| s.capacity() < buf.capacity() * c).unwrap_or(true) {
+                // v1.3.1 FIX: also rebuild when the stream's spec changes mid-file (channel count
+                // or rate switch in chained OGG / broadcast MP3); a buffer sized for the old
+                // layout made copy_interleaved_ref panic or mis-interleave frames.
+                if sb_spec != Some(spec) || sb.as_ref().map(|s| s.capacity() < buf.capacity() * c).unwrap_or(true) {
                     sb = Some(SampleBuffer::<i16>::new(buf.capacity() as u64, spec));
+                    sb_spec = Some(spec);
                 }
                 let s = sb.as_mut().unwrap();
                 s.copy_interleaved_ref(buf);
@@ -737,8 +789,8 @@ mod pulse_rec {
             let fb = 2 * ch as usize;         // bytes per frame (s16)
             let mut pend: Vec<u8> = Vec::new(); // received bytes not yet forming whole frames
             let mut smp: Vec<i16> = Vec::new();
-            loop {
-                let Ok(d) = pa::read_descriptor(&mut sock) else { break };
+            // v1.3.1 FIX (clippy while_let_loop): same behaviour, idiomatic form.
+            while let Ok(d) = pa::read_descriptor(&mut sock) {
                 if d.channel == u32::MAX {
                     // control message (overflow/started/moved/killed...): consume; stop if killed
                     match pa::Command::read_tag_prefixed(&mut sock, ver) {
@@ -975,7 +1027,7 @@ impl Recorder {
                     Err(e) => {
                         fails += 1;
                         if fails > fps * 5 {
-                            *sh_c.error.lock().unwrap() = Some(format!("capture failing: {e}"));
+                            *sh_c.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("capture failing: {e}"));
                             sh_c.stop.store(true, Relaxed);
                         }
                         if w_tx_c.send(WMsg::Dup(seq)).is_err() { return; }
@@ -1006,7 +1058,8 @@ impl Recorder {
             workers.push(thread::Builder::new().name(format!("enc{i}")).spawn(move || {
                 let mut scratch = Vec::new();
                 loop {
-                    let msg = { let g = rx.lock().unwrap(); g.recv() };
+                    // v1.3.1 FIX: a panicked sibling worker must not poison-panic the whole pool
+                    let msg = { let g = rx.lock().unwrap_or_else(|e| e.into_inner()); g.recv() };
                     let Ok((seq, buf)) = msg else { break };
                     let (data, w, h): (&[u8], usize, usize) = if half {
                         let (ow, oh) = half_bgra(&buf, cw, chh, &mut scratch);
@@ -1019,7 +1072,7 @@ impl Recorder {
                     let _ = ptx.send(buf); // recycle the raw frame buffer
                     let m = match r {
                         Ok(()) => WMsg::Frame(seq, out),
-                        Err(e) => { *sh_w.error.lock().unwrap() = Some(format!("jpeg encode: {e}")); WMsg::Dup(seq) }
+                        Err(e) => { *sh_w.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("jpeg encode: {e}")); WMsg::Dup(seq) }
                     };
                     if wtx.send(m).is_err() { break; }
                 }
@@ -1090,7 +1143,7 @@ impl Recorder {
                 idx.flush().map_err(es)?;
                 Ok(written)
             })();
-            if let Err(e) = &r { *sh_wr.error.lock().unwrap() = Some(e.clone()); sh_wr.stop.store(true, Relaxed); }
+            if let Err(e) = &r { *sh_wr.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.clone()); sh_wr.stop.store(true, Relaxed); }
             r
         }).map_err(es)?;
 
@@ -1109,7 +1162,7 @@ impl Recorder {
 
     /// Stop everything, join threads, return (frame count, mic, system audio); audio is
     /// (channels, 48 kHz interleaved samples) fitted exactly to the video length.
-    fn finish(mut self) -> Res<(u32, Option<(u16, Vec<i16>)>, Option<(u16, Vec<i16>)>)> {
+    fn finish(mut self) -> Res<(u32, Option<PcmTrack>, Option<PcmTrack>)> { // v1.3.1: PcmTrack alias
         let stop_at = self.sh.paused.active(Instant::now());
         self.sh.stop.store(true, Relaxed);
         if let Some(c) = self.cap.take() { let _ = c.join(); }
@@ -1300,10 +1353,10 @@ fn time_stretch(x: &[i16], ch: usize, out_frames: usize) -> Vec<i16> {
             }
         };
         let pos = pos.min(n_in.saturating_sub(W));
-        for i in 0..W {
+        // v1.3.1 FIX (clippy needless_range_loop): iterate the window directly.
+        for (i, &w) in win.iter().enumerate() {
             let (si, di) = (pos + i, o + i);
             if si >= n_in || di >= out_frames + W { break; }
-            let w = win[i];
             for c in 0..ch { acc[di * ch + c] += x[si * ch + c] as f32 * w; }
             wsum[di] += w;
         }
@@ -1448,14 +1501,14 @@ impl Edit {
         let mut new: Vec<Seg> = Vec::with_capacity(j - i);
         for s in &self.segs[i..j] {
             let l = s.len() as u64;
-            let nl = ((l * 100 + sp as u64 - 1) / sp as u64).max(1) as u32; // ceil
+            let nl = (l * 100).div_ceil(sp as u64).max(1) as u32; // ceil (v1.3.1: div_ceil)
             match *s {
                 Seg::Hold { frame, .. } => new.push(Seg::Hold { frame, len: nl }),
                 Seg::Src { .. } | Seg::Fast { .. } => {
                     let (old_sp, last) = match *s { Seg::Fast { sp: o, .. } => (o, s.max_src()), _ => (100, s.max_src()) };
                     let csp = (old_sp as u64 * sp as u64 / 100).clamp(SPEED_MIN as u64, SPEED_MAX as u64) as u32;
                     let start = s.src_at(0);
-                    let mut nl = ((l * old_sp as u64 + csp as u64 - 1) / csp as u64).max(1) as u32;
+                    let mut nl = (l * old_sp as u64).div_ceil(csp as u64).max(1) as u32; // v1.3.1: div_ceil
                     // never read past the original piece's last source frame
                     while nl > 1 && start as u64 + (nl as u64 - 1) * csp as u64 / 100 > last { nl -= 1; }
                     new.push(Seg::Fast { start, len: nl, sp: csp, ph: 0 });
@@ -1506,7 +1559,17 @@ impl Edit {
     }
 }
 
-struct Project { src: Arc<Source>, edit: Edit, undo: Vec<Edit>, redo: Vec<Edit>, dirty: bool }
+struct Project {
+    src: Arc<Source>, edit: Edit, undo: Vec<Edit>, redo: Vec<Edit>, dirty: bool,
+    /// v1.3.1 PERF: the sample buffer last written to `track_{i}.wav`, per index. A Weak (not
+    /// an Arc) so it never keeps audio alive, and it pins the allocation so the pointer can't
+    /// be reused (no ABA). Save skips a WAV whose buffer is unchanged: Ctrl+S on a long
+    /// project no longer rewrites hundreds of MB when only an edit or a gain changed.
+    saved: Vec<std::sync::Weak<Vec<i16>>>,
+}
+
+/// Max audio tracks accepted from a project file (v1.3.1: memory/DoS guard on load).
+const MAX_TRACKS: usize = 64;
 
 fn safe_file_name(s: &str) -> bool {
     !s.is_empty() && s.len() < 128 && !s.starts_with('.')
@@ -1519,6 +1582,13 @@ fn sanitize_name(s: &str) -> String {
 }
 
 impl Project {
+    /// v1.3.1 FIX: crash-safe save. v1.3.0 overwrote track WAVs in place and deleted stale
+    /// track files *before* project.txt was replaced, so a failure in between (disk full,
+    /// power loss, AV lock on Windows) left a project.txt pointing at deleted or half-written
+    /// tracks: the project would not open. Order now: (1) stage changed tracks as
+    /// `track_N.wav.new`, (2) write project.txt.tmp, (3) promote staged tracks, (4) atomically
+    /// swap project.txt, (5) only then remove stale files. Any error before (3) leaves the
+    /// previous save fully intact and cleans up the staging files.
     fn save(&mut self) -> Res<()> {
         let dir = self.src.dir.clone();
         let mut txt = format!("screenreel_project=1\nversion={VERSION}\nwidth={}\nheight={}\nfps={}\nmedia={}\n", self.src.w, self.src.h, self.src.fps, self.src.base);
@@ -1530,22 +1600,39 @@ impl Project {
             };
         }
         let mut keep = Vec::new();
+        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let cleanup = |staged: &[(PathBuf, PathBuf)]| for (n, _) in staged { let _ = std::fs::remove_file(n); };
         for (i, t) in self.edit.tracks.iter().enumerate() {
             let f = format!("track_{i}.wav");
-            write_wav(&dir.join(&f), t.ch, AR, &t.data)?;
+            let fin = dir.join(&f);
+            // v1.3.1 PERF: unchanged buffer + file still present -> nothing to write
+            let same = self.saved.get(i).map(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(&t.data))).unwrap_or(false);
+            if !(same && fin.is_file()) {
+                let new = dir.join(format!("{f}.new"));
+                if let Err(e) = write_wav(&new, t.ch, AR, &t.data) { cleanup(&staged); let _ = std::fs::remove_file(&new); return Err(e); }
+                staged.push((new, fin));
+            }
+            // gain is always finite here (UI slider / clamped on load); `{}` of f32 round-trips
             txt += &format!("track={}|{}|{}|{}\n", sanitize_name(&t.name), t.gain, t.muted as u8, f);
             keep.push(f);
         }
-        // Remove stale track files from earlier saves.
+        let tmp = dir.join("project.txt.tmp");
+        if let Err(e) = std::fs::write(&tmp, &txt) { cleanup(&staged); let _ = std::fs::remove_file(&tmp); return Err(format!("project.txt: {e}")); }
+        for (new, fin) in &staged {
+            if let Err(e) = std::fs::rename(new, fin) { cleanup(&staged); let _ = std::fs::remove_file(&tmp); return Err(format!("{}: {e}", fin.display())); }
+        }
+        std::fs::rename(&tmp, dir.join("project.txt")).map_err(|e| format!("project.txt: {e}"))?;
+        // Remove stale track files from earlier saves (and leftovers of interrupted ones),
+        // now that project.txt no longer references them.
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
-                if n.starts_with("track_") && n.ends_with(".wav") && !keep.contains(&n) { let _ = std::fs::remove_file(e.path()); }
+                let stale = n.starts_with("track_") && (n.ends_with(".wav.new") || n.ends_with(".wav.tmp") || n.ends_with(".new.tmp")
+                    || (n.ends_with(".wav") && !keep.contains(&n)));
+                if stale { let _ = std::fs::remove_file(e.path()); }
             }
         }
-        let tmp = dir.join("project.txt.tmp");
-        std::fs::write(&tmp, txt).map_err(es)?;
-        std::fs::rename(&tmp, dir.join("project.txt")).map_err(es)?;
+        self.saved = self.edit.tracks.iter().map(|t| Arc::downgrade(&t.data)).collect();
         self.dirty = false;
         Ok(())
     }
@@ -1586,6 +1673,10 @@ impl Project {
                     let p: Vec<&str> = v.split('|').collect();
                     if p.len() != 4 || !safe_file_name(p[3]) { return Err(format!("bad track line: {line}")); }
                     let gain: f32 = p[1].parse().map_err(es)?;
+                    // v1.3.1 FIX: "NaN"/"inf" parse fine and f32::clamp passes NaN through, which
+                    // turned the whole mix into NaN (silence/garbage). Reject non-finite gains.
+                    if !gain.is_finite() { return Err(format!("bad track gain: {line}")); }
+                    if tdefs.len() >= MAX_TRACKS { return Err("too many tracks".into()); }
                     tdefs.push((p[0].to_string(), gain.clamp(0.0, 4.0), p[2] == "1", p[3].to_string()));
                 }
                 _ => {}
@@ -1604,13 +1695,19 @@ impl Project {
         }
         if total > u32::MAX as u64 / 2 { return Err("project too long".into()); }
         let mut tracks = Vec::new();
-        for (name, gain, muted, f) in tdefs {
+        let mut saved = Vec::new();
+        for (i, (name, gain, muted, f)) in tdefs.into_iter().enumerate() {
             let (ch, data) = decode_audio(&dir.join(&f))?;
-            tracks.push(Track { name: sanitize_name(&name), ch, data: Arc::new(data), gain, muted });
+            let data = Arc::new(data);
+            // v1.3.1 PERF: a track read from its canonical file need not be rewritten on save,
+            // unless it was resampled/converted on load (not 48 kHz s16) -- then rewrite once.
+            let canonical = f == format!("track_{i}.wav") && wav_is_canonical(&dir.join(&f), ch, data.len());
+            saved.push(if canonical { Arc::downgrade(&data) } else { std::sync::Weak::new() });
+            tracks.push(Track { name: sanitize_name(&name), ch, data, gain, muted });
         }
         let mut edit = Edit { segs, tracks };
         edit.normalize();
-        Ok(Project { src, edit, undo: vec![], redo: vec![], dirty: false })
+        Ok(Project { src, edit, undo: vec![], redo: vec![], dirty: false, saved })
     }
 }
 
@@ -1972,7 +2069,8 @@ enum JobOut {
     Msg(String),
     /// Dead-air ranges plus the edit generation they were computed for.
     DeadAir { ranges: Vec<(u32, u32)>, gen: u64 },
-    Compact { src: Source, before: u64, after: u64 },
+    /// v1.3.1: `gen` = edit generation the compaction was computed for.
+    Compact { src: Source, before: u64, after: u64, gen: u64 },
 }
 
 /// Dead-air scan parameters (output-frame units after conversion).
@@ -2009,7 +2107,6 @@ fn find_dead_air(src: &Source, edit: &Edit, cfg: DeadCfg, progress: &AtomicU32, 
     let mut out = Vec::new();
     let mut run_start: Option<u32> = None;
     let mut anchor: Option<(u64, Vec<u8>, usize, usize)> = None; // (offset, rgb, w, h)
-    let mut f = 0u32;
     // flat iteration over segments avoids O(n*segs) src_frame lookups
     let frames: Box<dyn Iterator<Item = u32>> = Box::new(edit.segs.iter().flat_map(|s| (0..s.len()).map(move |k| s.src_at(k))));
     let close = |out: &mut Vec<(u32, u32)>, a: u32, b: u32| {
@@ -2017,13 +2114,20 @@ fn find_dead_air(src: &Source, edit: &Edit, cfg: DeadCfg, progress: &AtomicU32, 
         let (a2, b2) = (if a == 0 { 0 } else { a + cfg.pad_frames }, if b >= total { total } else { b.saturating_sub(cfg.pad_frames) });
         if b2 > a2 && b2 - a2 >= cfg.min_frames.max(1) { out.push((a2, b2)); }
     };
-    for sf in frames {
+    // v1.3.1 FIX (clippy explicit_counter_loop): enumerate instead of a manual counter.
+    for (f, sf) in frames.enumerate() {
+        let f = f as u32;
         if f % 256 == 0 {
             if cancel.load(Relaxed) { return Err("scan cancelled".into()); }
             progress.store((f as u64 * 1000 / total.max(1) as u64) as u32, Relaxed);
         }
+        // v1.3.1 PERF: test the (cheap) audio first. While anything is audible the frame can't
+        // be dead, so skip the JPEG decode and drop the anchor; v1.3.0 decoded every changed
+        // frame of narrated, screen-active footage only to discard the result.
+        let quiet = silent(f);
+        if !quiet { anchor = None; }
         let (off, _) = src.entry(sf).ok_or("missing frame")?;
-        let still = match &anchor {
+        let still = quiet && match &anchor {
             Some((ao, ..)) if *ao == off => true,
             Some((_, argb, w, h)) => {
                 let (rgb, w2, h2) = decode_jpeg_rgb(&src.read(sf)?)?;
@@ -2033,29 +2137,39 @@ fn find_dead_air(src: &Source, edit: &Edit, cfg: DeadCfg, progress: &AtomicU32, 
             }
             None => { let (rgb, w, h) = decode_jpeg_rgb(&src.read(sf)?)?; anchor = Some((off, rgb, w, h)); false }
         };
-        let dead = still && silent(f);
+        let dead = still; // `still` already implies `quiet`
         match (dead, run_start) {
             (true, None) => run_start = Some(f),
             (false, Some(a)) => { close(&mut out, a, f); run_start = None; }
             _ => {}
         }
-        f += 1;
     }
     if let Some(a) = run_start { close(&mut out, a, total); }
     progress.store(1000, Relaxed);
     Ok(out)
 }
 
-fn export_mkv(path: &Path, src: &Source, edit: &Edit, progress: &AtomicU32, cancel: &AtomicBool) -> Res<()> {
+/// Export the timeline as MKV. `span` maps this job's 0..100 % into a slice of the shared
+/// progress bar (v1.3.1: MOV/MP4 run MKV + ffmpeg as two phases of one bar).
+fn export_mkv(path: &Path, src: &Source, edit: &Edit, progress: &AtomicU32, cancel: &AtomicBool, span: (u32, u32)) -> Res<()> {
+    let tmp = path.with_extension("mkv.part");
+    let r = export_mkv_inner(path, &tmp, src, edit, progress, cancel, span);
+    // v1.3.1 FIX: v1.3.0 removed the .part file only on cancel; a write error (disk full,
+    // unreadable frame) left a multi-GB orphan next to the target. Clean up on every error.
+    if r.is_err() { let _ = std::fs::remove_file(&tmp); }
+    r
+}
+
+fn export_mkv_inner(path: &Path, tmp: &Path, src: &Source, edit: &Edit, progress: &AtomicU32, cancel: &AtomicBool, span: (u32, u32)) -> Res<()> {
     use mkv::*;
     let total = edit.total();
     if total == 0 { return Err("timeline is empty".into()); }
+    let prog = |f: u32| span.0 + ((span.1 - span.0) as u64 * f as u64 / total as u64) as u32;
     let fps = src.fps;
     let spf = src.spf();
     let ts = mix_tracks(edit, None);
     let has_audio = !edit.tracks.is_empty();
-    let tmp = path.with_extension("mkv.part");
-    let mut w = BufWriter::with_capacity(8 << 20, File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?);
+    let mut w = BufWriter::with_capacity(8 << 20, File::create(tmp).map_err(|e| format!("{}: {e}", tmp.display()))?);
     let uid = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) | 1;
 
     let ebml = el(0x1A45DFA3, &cat(&[uint(0x4286, 1), uint(0x42F7, 1), uint(0x42F2, 4), uint(0x42F3, 8),
@@ -2099,7 +2213,7 @@ fn export_mkv(path: &Path, src: &Source, edit: &Edit, progress: &AtomicU32, canc
     let mut abuf = Vec::with_capacity(spf * 4);
     let mut f = 0u32;
     while f < total {
-        if cancel.load(Relaxed) { drop(w); let _ = std::fs::remove_file(&tmp); return Err("export cancelled".into()); }
+        if cancel.load(Relaxed) { return Err("export cancelled".into()); } // caller removes the .part
         let c_ms = f as u64 * 1000 / fps as u64;
         let c_end = (f + fps).min(total);
         let mut body = uint(0xE7, c_ms);
@@ -2127,7 +2241,7 @@ fn export_mkv(path: &Path, src: &Source, edit: &Edit, progress: &AtomicU32, canc
         cues.extend(el(0xBB, &cat(&[uint(0xB3, c_ms), el(0xB7, &cat(&[uint(0xF7, 1), uint(0xF1, pos)]))])));
         pos += cl.len() as u64;
         f = c_end;
-        progress.store((f as u64 * 1000 / total as u64) as u32, Relaxed);
+        progress.store(prog(f), Relaxed);
     }
     let cues_p = pos;
     let cues_el = el(0x1C53BB6B, &cues);
@@ -2144,16 +2258,29 @@ fn export_mkv(path: &Path, src: &Source, edit: &Edit, progress: &AtomicU32, canc
     file.write_all(&mk_seekhead(info_p, tracks_p, cues_p)).map_err(es)?;
     file.sync_all().map_err(es)?;
     drop(file);
-    std::fs::rename(&tmp, path).map_err(es)?;
+    std::fs::rename(tmp, path).map_err(es)?;
     Ok(())
 }
 
-fn export_wav(path: &Path, src: &Source, edit: &Edit) -> Res<()> {
+/// v1.3.1 PERF/FIX: streams the mix straight to disk in 1 s blocks. v1.3.0 built the whole
+/// stereo mix in RAM first (a 2 h project = ~1.4 GB), had no progress and ignored Cancel.
+fn export_wav(path: &Path, src: &Source, edit: &Edit, progress: &AtomicU32, cancel: &AtomicBool) -> Res<()> {
     let n = edit.total() as usize * src.spf();
+    if n == 0 { return Err("timeline is empty".into()); }
     let ts = mix_tracks(edit, None);
-    let mut out = Vec::with_capacity(n * 2);
-    for i in 0..n { let (l, r) = mix_frame(&ts, i); out.push(f2i(soft_ceiling(l))); out.push(f2i(soft_ceiling(r))); }
-    write_wav(path, 2, AR, &out)
+    write_wav_with(path, 2, AR, n as u64 * 2, |w| {
+        let mut buf = Vec::with_capacity(AR as usize * 4);
+        let mut i = 0usize;
+        while i < n {
+            if cancel.load(Relaxed) { return Err("export cancelled".into()); }
+            let k = (AR as usize).min(n - i);
+            mix_bytes(&ts, i, k, &mut buf);
+            w.write_all(&buf).map_err(es)?;
+            i += k;
+            progress.store((i as u64 * 1000 / n as u64) as u32, Relaxed);
+        }
+        Ok(())
+    })
 }
 
 // ---- ffmpeg discovery -----------------------------------------------------------------
@@ -2231,21 +2358,67 @@ fn find_ffmpeg() -> Option<PathBuf> {
 }
 
 /// Run ffmpeg on an exported MKV. Args are passed as argv (no shell → no injection).
-fn ffmpeg_convert(exe: &Path, input: &Path, output: &Path, lossless_remux: bool) -> Res<()> {
+/// v1.3.1 FIX/PERF: v1.3.0 blocked in `Command::output()`, so Cancel did nothing during the
+/// (long) H.264 encode and the bar sat at 100 %. Now the child is polled every 50 ms, killed
+/// on cancel, and `-progress pipe:1` drives the bar over `span`. stdout and stderr are drained
+/// on helper threads (no pipe-buffer deadlock); only the stderr tail is kept for the message.
+#[allow(clippy::too_many_arguments)]
+fn ffmpeg_convert(exe: &Path, input: &Path, output: &Path, lossless_remux: bool, dur_us: u64,
+                  progress: &AtomicU32, cancel: &AtomicBool, span: (u32, u32)) -> Res<()> {
+    use std::io::BufRead;
     let mut c = ffmpeg_cmd(exe);
-    c.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(input);
+    c.args(["-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y", "-i"]).arg(input);
     if lossless_remux {
         c.args(["-c", "copy", "-f", "mov"]);
     } else {
         c.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-f", "mp4"]);
     }
-    c.arg(output).stdout(std::process::Stdio::null());
-    let out = c.output().map_err(|e| format!("ffmpeg: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("ffmpeg failed: {}", err.lines().last().unwrap_or("unknown error")));
+    c.arg(output).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().map_err(|e| format!("ffmpeg: {e}"))?;
+    let done_us = Arc::new(AtomicU64::new(0));
+    let so = child.stdout.take().map(|o| {
+        let d = done_us.clone();
+        thread::spawn(move || {
+            for l in std::io::BufReader::new(o).lines().map_while(Result::ok) {
+                // out_time_us (newer ffmpeg) / out_time_ms (older: also microseconds)
+                if let Some(v) = l.strip_prefix("out_time_us=").or_else(|| l.strip_prefix("out_time_ms=")) {
+                    if let Ok(x) = v.trim().parse::<u64>() { d.store(x, Relaxed); }
+                }
+            }
+        })
+    });
+    let se = child.stderr.take().map(|mut e| thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = e.read_to_end(&mut v);
+        if v.len() > 8192 { v.drain(..v.len() - 8192); }
+        v
+    }));
+    let status = loop {
+        if cancel.load(Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(output);
+            return Err("export cancelled".into());
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                let f = (done_us.load(Relaxed) as f64 / dur_us.max(1) as f64).clamp(0.0, 1.0);
+                progress.store(span.0 + ((span.1 - span.0) as f64 * f) as u32, Relaxed);
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => { let _ = child.kill(); return Err(format!("ffmpeg: {e}")); }
+        }
+    };
+    if let Some(h) = so { let _ = h.join(); }
+    let err = se.and_then(|h| h.join().ok()).unwrap_or_default();
+    if !status.success() {
+        let _ = std::fs::remove_file(output); // v1.3.1 FIX: no truncated MP4 left behind
+        let err = String::from_utf8_lossy(&err);
+        return Err(format!("ffmpeg failed: {}", err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error")));
     }
+    progress.store(span.1, Relaxed);
     Ok(())
 }
 
@@ -2266,8 +2439,9 @@ impl Decoder {
         thread::Builder::new().name("preview-dec".into()).spawn(move || loop {
             let r = {
                 let (m, cv) = &*rq;
-                let mut g = m.lock().unwrap();
-                while g.is_none() { g = cv.wait(g).unwrap(); }
+                // v1.3.1 FIX: poison-tolerant locks (a panic elsewhere must not kill the preview)
+                let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                while g.is_none() { g = cv.wait(g).unwrap_or_else(|e| e.into_inner()); }
                 g.take().unwrap()
             };
             let out = r.src.read(r.frame).and_then(|j| decode_jpeg_rgb(&j));
@@ -2275,7 +2449,7 @@ impl Decoder {
                 let (fw, fh) = fit(w as i32, h as i32, r.tw, r.th);
                 let (ow, oh) = if fw as usize >= w { (w, h) } else { (fw as usize, fh as usize) };
                 let px = scale_rgb(&rgb, w, h, ow, oh);
-                *rs.lock().unwrap() = Some(DecRes { frame: r.frame, tw: r.tw, th: r.th, w: ow as i32, h: oh as i32, rgb: px });
+                *rs.lock().unwrap_or_else(|e| e.into_inner()) = Some(DecRes { frame: r.frame, tw: r.tw, th: r.th, w: ow as i32, h: oh as i32, rgb: px });
                 app::awake();
             }
         }).expect("spawn decoder");
@@ -2286,7 +2460,7 @@ impl Decoder {
         if self.last == Some(key) || tw <= 0 || th <= 0 { return; }
         self.last = Some(key);
         let (m, cv) = &*self.req;
-        *m.lock().unwrap() = Some(DecReq { src: src.clone(), frame, tw, th }); // latest wins
+        *m.lock().unwrap_or_else(|e| e.into_inner()) = Some(DecReq { src: src.clone(), frame, tw, th }); // latest wins
         cv.notify_one();
     }
 }
@@ -2355,7 +2529,7 @@ impl App {
         let mut results: Vec<(usize, Vec<i16>)> = Vec::new();
         let mut report = Vec::new();
         for &i in &idx {
-            let t = &p.edit.tracks[i];
+            let Some(t) = p.edit.tracks.get(i) else { continue }; // v1.3.1 FIX: no panic on stale index
             match loudness_lufs(&t.data, t.ch as usize) {
                 None => report.push(format!("{}: silent, skipped", t.name)),
                 Some(l) => {
@@ -2439,7 +2613,7 @@ impl App {
         let excl = self.narr.as_ref().map(|n| n.track);
         let over = self.fx_preview.as_ref().filter(|o| self.proj.as_ref().map(|p| o.0 < p.edit.tracks.len()).unwrap_or(false));
         let (ts, end) = match &self.proj { Some(p) => (mix_tracks_with(&p.edit, excl, over), p.edit.total() as u64 * p.src.spf() as u64), None => (vec![], 0) };
-        *self.play.mix.lock().unwrap() = ts;
+        *self.play.mix.lock().unwrap_or_else(|e| e.into_inner()) = ts; // v1.3.1 FIX: poison-tolerant
         self.play.end.store(end, Relaxed);
     }
 
@@ -2523,19 +2697,21 @@ impl App {
     fn start_narration(&mut self, mic: Option<String>) -> Res<()> {
         if self.proj.is_none() { return Err("record or open a project first".into()); }
         if self.narr.is_some() { return Ok(()); }
-        { let (a, b) = self.sel.unwrap_or((self.playhead, self.total())); if b <= a + 1 { return Err("Move the playhead before the end, or select a range to re-record".into()); } }
-        let ti = match self.sel_track {
-            Some(t) => t,
-            None => {
-                let n = self.proj.as_ref().unwrap().edit.tracks.len() + 1;
-                self.add_track(format!("Narration {n}"), 1, vec![], 0);
-                self.sel_track.unwrap()
-            }
-        };
         let (a, b) = self.sel.unwrap_or((self.playhead, self.total()));
         if b <= a + 1 { return Err("Move the playhead before the end, or select a range to re-record".into()); }
+        // v1.3.1 FIX: open the mic *before* touching the project. v1.3.0 added the new
+        // "Narration N" track first, so a busy/missing mic left an empty track behind, and a
+        // successful take cost two undo steps (add track + record). Now: one undo step,
+        // and nothing changes if the mic fails.
         let m = AudioCapture::start(AudioSrc::Mic(mic.as_deref()), Arc::new(PauseClock::default()))?;
-        self.push_undo();
+        let ti = match self.sel_track.filter(|&t| self.proj.as_ref().map(|p| t < p.edit.tracks.len()).unwrap_or(false)) {
+            Some(t) => { self.push_undo(); t }
+            None => {
+                let n = self.proj.as_ref().map(|p| p.edit.tracks.len() + 1).unwrap_or(1);
+                self.add_track(format!("Narration {n}"), 1, vec![], 0); // add_track pushes the undo step
+                self.sel_track.unwrap_or(0)
+            }
+        };
         self.narr = Some(NarrRec { mic: m, track: ti, start: a, end: b, clear: self.sel.is_some() });
         self.sync_mix(); // excludes the track being re-recorded from playback
         self.seek(a);
@@ -2607,7 +2783,10 @@ fn fmt_speed(sp: u32) -> String {
 
 fn fmt_time(frames: u32, fps: u32) -> String {
     let cs = (frames as u64 * 100 + fps.max(1) as u64 / 2) / fps.max(1) as u64; // rounded centiseconds
-    format!("{:02}:{:02}.{:02}", cs / 6000, cs / 100 % 60, cs % 100)
+    // v1.3.1 FIX: past 99:59 the minutes field grew to 3 digits and the ruler's fixed [..5]
+    // slice cut labels mid-number ("100:0"). Use H:MM:SS.cc from one hour on.
+    if cs >= 360_000 { format!("{}:{:02}:{:02}.{:02}", cs / 360_000, cs / 6000 % 60, cs / 100 % 60, cs % 100) }
+    else { format!("{:02}:{:02}.{:02}", cs / 6000, cs / 100 % 60, cs % 100) }
 }
 
 fn lane_h(app: &App, h: i32) -> i32 {
@@ -2648,7 +2827,9 @@ fn draw_timeline(app: &mut App, tl: &Frame) {
         draw::set_draw_color(Color::from_rgb(120, 125, 135));
         draw::draw_yxline(x, y0 + 8, y0 + RULER_H);
         draw::set_draw_color(Color::from_rgb(190, 190, 190));
-        draw::draw_text(&fmt_time((t * fps as f64).round() as u32, fps)[..if step >= 1.0 { 5 } else { 8 }], x + 3, y0 + 11);
+        let lbl = fmt_time((t * fps as f64).round() as u32, fps);
+        // v1.3.1 FIX: drop the ".cc" suffix by length, not a fixed byte offset (H:MM:SS labels)
+        draw::draw_text(if step >= 1.0 { &lbl[..lbl.len() - 3] } else { &lbl }, x + 3, y0 + 11);
     }
     // Selection band
     if let Some((a, b)) = app.sel {
@@ -3012,7 +3193,7 @@ fn stop_recording(app: &Shared, ui: &Ui) {
     app::flush();
     let Some(rec) = rec else { if pending { abort_ctl(app, ui); } return };
     let (fps, dims, dir) = (rec.fps, rec.dims, rec.dir.clone());
-    let err = rec.sh.error.lock().unwrap().clone()
+    let err = rec.sh.error.lock().unwrap_or_else(|e| e.into_inner()).clone() // v1.3.1 FIX: poison-tolerant
         .or_else(|| rec.mic_error.clone().map(|e| format!("mic unavailable: {e}")))
         .or_else(|| rec.sys_error.clone().map(|e| format!("system audio unavailable: {e}")));
     let dropped = rec.sh.dups.load(Relaxed);
@@ -3024,7 +3205,7 @@ fn stop_recording(app: &Shared, ui: &Ui) {
         // Separate tracks: mic and system audio can be muted/replaced/re-recorded independently.
         if let Some((ch, m)) = mic { tracks.push(Track { name: "Mic".into(), ch, data: Arc::new(m), gain: 1.0, muted: false }); }
         if let Some((ch, v)) = sys { tracks.push(Track { name: "System".into(), ch, data: Arc::new(v), gain: 1.0, muted: false }); }
-        let mut p = Project { edit: Edit { segs: vec![Seg::Src { start: 0, len: src.count() }], tracks }, src, undo: vec![], redo: vec![], dirty: true };
+        let mut p = Project { edit: Edit { segs: vec![Seg::Src { start: 0, len: src.count() }], tracks }, src, undo: vec![], redo: vec![], dirty: true, saved: vec![] };
         p.save()?;
         Ok((p, frames))
     }) {
@@ -3033,14 +3214,13 @@ fn stop_recording(app: &Shared, ui: &Ui) {
             let secs = frames as f64 / fps as f64;
             a.status = format!("Recorded {secs:.1}s ({}×{} @ {fps} fps, {dropped} dropped/duplicated) → {}{}", dims.0, dims.1, dir.display(),
                 err.map(|e| format!("  [warning: {e}]")).unwrap_or_default());
-            a.proj = Some(p);
-            a.sel = None;
-            a.sel_track = None;
-            a.playhead = 0;
-            a.scroll = 0.0;
-            a.zoom = (ui.timeline.w() as f64 / frames.max(1) as f64).max(1e-4);
-            a.after_edit();
-            a.seek(0);
+            // v1.3.1 FIX: go through set_project like New/Open. v1.3.0 assigned `proj` directly,
+            // so edit_gen was not bumped: dead-air ranges found on the *previous* project still
+            // counted as valid (red bands + "Remove dead air" enabled) and could be cut from the
+            // new recording; peaks/FX-audition state also leaked across projects.
+            let status = std::mem::take(&mut a.status);
+            a.set_project(Some(p), ui.timeline.w());
+            a.status = status;
         }
         Err(e) => alert(&format!("Recording failed:\n{e}")),
     }
@@ -3055,6 +3235,11 @@ fn choose_file(title: &str, filter: &str, save: Option<&str>) -> Option<PathBuf>
     d.show();
     let f = d.filename();
     if f.as_os_str().is_empty() { None } else { Some(std::path::absolute(&f).unwrap_or(f)) }
+}
+
+/// v1.3.1: same directory, tolerant of relative/symlinked spellings.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) { (Ok(x), Ok(y)) => x == y, _ => a == b }
 }
 
 fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
@@ -3411,9 +3596,15 @@ fn start_compact(app: &Shared, ui: &Ui) {
     }
     let msg = "Compact project?\n\nThe recording is rewritten to hold only the frames your edit uses, so cut and\ndead-air footage stops taking disk space. It is lossless (JPEG bytes are copied),\nbut the edit is flattened, and undo history is cleared. The project is saved.";
     if dialog::choice2_default(msg, "Cancel", "Compact", "") != Some(1) { return; }
-    let (src, edit) = { let mut a = app.borrow_mut(); a.set_playing(false); let p = a.proj.as_ref().unwrap(); (p.src.clone(), p.edit.clone()) };
+    // v1.3.1 FIX: no unwrap (project may have been closed while the dialog was open) + gen.
+    let (src, edit, gen) = {
+        let mut a = app.borrow_mut();
+        a.set_playing(false);
+        let Some(p) = a.proj.as_ref() else { return };
+        (p.src.clone(), p.edit.clone(), a.edit_gen)
+    };
     spawn_job(app, ui, "Compacting", move |pg, _| {
-        src.compact(&edit, pg).map(|(src, before, after)| JobOut::Compact { src, before, after })
+        src.compact(&edit, pg).map(|(src, before, after)| JobOut::Compact { src, before, after, gen })
     });
 }
 
@@ -3429,16 +3620,28 @@ fn start_export(app: &Shared, ui: &Ui, kind: &'static str) {
     let (filter, ext) = match kind { "mkv" => ("Matroska\t*.mkv", "mkv"), "mov" => ("QuickTime MOV\t*.mov", "mov"), "mp4" => ("MP4\t*.mp4", "mp4"), _ => ("WAV audio\t*.wav", "wav") };
     let Some(path) = choose_file("Export", filter, Some(&format!("{base}.{ext}"))) else { return };
     let path = with_ext(path, ext);
+    // v1.3.1 FIX: refuse to export over the project's own files (e.g. "track_0.wav" in the
+    // project folder would silently replace an audio track that Save/Open rely on).
+    if path.parent().map(|d| same_dir(d, &src.dir)).unwrap_or(false) {
+        let n = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if n.starts_with("track_") || n.starts_with("project.txt") || n.starts_with(&format!("{}.", src.base)) {
+            alert(&format!("{n} is one of this project's own files. Choose another name or folder."));
+            return;
+        }
+    }
+    let dur_us = edit.total() as u64 * 1_000_000 / src.fps.max(1) as u64;
     spawn_job(app, ui, &format!("Exporting {}", kind.to_uppercase()), move |pg, cc| {
         let t0 = Instant::now();
         match (kind, ff) {
-            ("mkv", _) => export_mkv(&path, &src, &edit, pg, cc)?,
-            ("wav", _) => export_wav(&path, &src, &edit)?,
+            ("mkv", _) => export_mkv(&path, &src, &edit, pg, cc, (0, 1000))?,
+            ("wav", _) => export_wav(&path, &src, &edit, pg, cc)?,
             (_, Some(ff)) => {
                 let tmp = path.with_extension("srtmp.mkv");
-                export_mkv(&tmp, &src, &edit, pg, cc)?;
-                let r = ffmpeg_convert(&ff, &tmp, &path, kind == "mov");
-                let _ = std::fs::remove_file(&tmp);
+                // MOV is a quick remux; MP4 re-encodes, so ffmpeg gets most of the bar.
+                let split = if kind == "mov" { 500 } else { 150 };
+                let r = export_mkv(&tmp, &src, &edit, pg, cc, (0, split))
+                    .and_then(|_| ffmpeg_convert(&ff, &tmp, &path, kind == "mov", dur_us, pg, cc, (split, 1000)));
+                let _ = std::fs::remove_file(&tmp); // v1.3.1 FIX: also on MKV-phase errors
                 r?;
             }
             _ => return Err("ffmpeg not available".into()),
@@ -3449,8 +3652,19 @@ fn start_export(app: &Shared, ui: &Ui, kind: &'static str) {
 
 /// Swap in the compacted media: flatten the edit to one Src run, clear undo, save, and
 /// delete the old media pair (best effort; the decoder may still hold it open briefly).
-fn apply_compact(a: &mut App, src: Source, before: u64, after: u64) -> String {
+fn apply_compact(a: &mut App, src: Source, before: u64, after: u64, gen: u64) -> String {
     let total = src.count();
+    // v1.3.1 FIX: the compacted media matches the edit *as it was when the job started*.
+    // v1.3.0 flattened the current segs to it unconditionally, so any change made meanwhile
+    // (track nudge, gain, narration...) was applied to the wrong frames and audio desynced.
+    // Also guard against the project having been replaced. Discard the new media in that case.
+    let same_proj = a.proj.as_ref().map(|p| p.src.dir == src.dir).unwrap_or(false);
+    if gen != a.edit_gen || !same_proj {
+        if src.base != a.proj.as_ref().map(|p| p.src.base.clone()).unwrap_or_default() || !same_proj {
+            for ext in ["mjpg", "idx"] { let _ = std::fs::remove_file(src.dir.join(format!("{}.{ext}", src.base))); }
+        }
+        return "Compact discarded: the project changed while compacting. Run it again.".into();
+    }
     let Some(p) = a.proj.as_mut() else { return "Compact finished but the project was closed".into() };
     let old = p.src.clone();
     p.src = Arc::new(src);
@@ -3503,7 +3717,7 @@ fn tick(app: &Shared, ui: &Ui) {
                     else if n == 0 { "No dead air found".into() }
                     else { format!("Found {n} dead-air region(s), {:.1}s total (red). Click \"Remove dead air\" to cut them.", secs as f64 / fps) }
                 }
-                Ok(JobOut::Compact { src, before, after }) => apply_compact(&mut a, src, before, after),
+                Ok(JobOut::Compact { src, before, after, gen }) => apply_compact(&mut a, src, before, after, gen),
                 Err(e) => format!("{label} failed: {e}"),
             };
             need = true;
@@ -3549,7 +3763,7 @@ fn tick(app: &Shared, ui: &Ui) {
     }
     request_preview(&mut a, ui);
     // Decoded preview frame
-    let res = a.dec.res.lock().unwrap().take();
+    let res = a.dec.res.lock().unwrap_or_else(|e| e.into_inner()).take(); // v1.3.1 FIX
     if let Some(r) = res {
         if let Ok(img) = RgbImage::new(&r.rgb, r.w, r.h, fltk::enums::ColorDepth::Rgb8) { a.preview = Some((img, r.frame)); }
         let _ = (r.tw, r.th);
@@ -3958,8 +4172,11 @@ fn wire(app: &Shared, ui: &Ui) {
                         // zoom about mouse
                         let at = s.scroll + (ex - f.x()) as f64 / s.zoom;
                         let k = if dy > 0 { 1.0 / 1.25 } else { 1.25 };
-                        let minz = f.w() as f64 / s.total().max(1) as f64 * 0.5;
-                        s.zoom = (s.zoom * k).clamp(minz, 64.0);
+                        // v1.3.1 FIX: on clips shorter than ~w/128 frames minz exceeded 64 and
+                        // f64::clamp(min > max) panicked, killing the app on Ctrl+wheel.
+                        let maxz = 64.0;
+                        let minz = (f.w() as f64 / s.total().max(1) as f64 * 0.5).min(maxz);
+                        s.zoom = (s.zoom * k).clamp(minz, maxz);
                         s.scroll = (at - (ex - f.x()) as f64 / s.zoom).max(0.0);
                     } else {
                         let d = if dx != 0 { dx } else { dy };
@@ -4108,10 +4325,21 @@ fn wire(app: &Shared, ui: &Ui) {
         let a2 = app.clone();
         w.set_callback(move |w| {
             if app::event() != Event::Close { return; }
+            // v1.3.1 FIX: finish an in-progress narration take first. v1.3.0 dropped the mic
+            // capture on quit, so the take was lost even when the user chose "Save".
+            if a2.borrow().narr.is_some() { a2.borrow_mut().stop_narration(); }
             let dirty = a2.borrow().proj.as_ref().map(|p| p.dirty).unwrap_or(false);
             if a2.borrow().job.is_some() {
                 if dialog::choice2_default("A background job (export/scan/compact) is running. Cancel it and quit?", "Keep working", "Quit", "") != Some(1) { return; }
-                if let Some(j) = &a2.borrow().job { j.cancel.store(true, Relaxed); }
+                // v1.3.1 FIX: cancel *and wait* (bounded) so the worker can delete its partial
+                // output and kill a running ffmpeg, instead of being torn down mid-write.
+                let job = a2.borrow_mut().job.take();
+                if let Some(j) = job {
+                    j.cancel.store(true, Relaxed);
+                    let t = Instant::now();
+                    while !j.handle.is_finished() && t.elapsed() < Duration::from_secs(5) { thread::sleep(Duration::from_millis(20)); }
+                    if j.handle.is_finished() { let _ = j.handle.join(); }
+                }
             }
             if dirty {
                 match dialog::choice2_default("Save changes to the project before quitting?", "Cancel", "Save", "Don't save") {
@@ -4191,7 +4419,7 @@ fn selftest(out: &Path, secs: f64, full: bool, sys: bool) -> Res<()> {
     // --- v1.3.0: loudness meter accuracy, normalization ceiling, opto compressor gain reduction
     {
         let sine = |amp: f32, secs: usize, ch: usize| -> Vec<i16> {
-            (0..AR as usize * secs).flat_map(|i| { let v = ((i as f32 * 997.0 * std::f32::consts::TAU / AR as f32).sin() * amp * 32767.0) as i16; std::iter::repeat_n(v, ch) }).collect()
+            (0..AR as usize * secs).flat_map(|i| { let v = ((i as f32 * 997.0 * std::f32::consts::TAU / AR as f32).sin() * amp * 32767.0) as i16; std::iter::repeat(v).take(ch) /* v1.3.1 FIX: repeat_n needs Rust 1.82 > MSRV 1.79 */ }).collect()
         };
         // BS.1770: a full-scale-relative stereo 997 Hz sine at A dBFS peak reads ~A LUFS
         let st = sine(0.1, 4, 2);
@@ -4268,11 +4496,39 @@ fn selftest(out: &Path, secs: f64, full: bool, sys: bool) -> Res<()> {
             assert_eq!(d.tracks[0].frames(), d.total() as usize * spf);
         }
     }
-    let mut p = Project { src: src.clone(), edit: e.clone(), undo: vec![], redo: vec![], dirty: true };
+    let mut p = Project { src: src.clone(), edit: e.clone(), undo: vec![], redo: vec![], dirty: true, saved: vec![] };
     p.save()?;
-    let p2 = Project::load(&dir)?;
+    let mut p2 = Project::load(&dir)?;
     assert_eq!(p2.edit.segs, p.edit.segs);
     assert_eq!(p2.edit.tracks[0].data.len(), p.edit.tracks[0].data.len());
+    // --- v1.3.1: save skips unchanged tracks, removes stale/staging files only after the swap
+    {
+        let t0p = dir.join("track_0.wav");
+        let m0 = std::fs::metadata(&t0p).and_then(|m| m.modified()).map_err(es)?;
+        std::fs::write(dir.join("track_9.wav"), b"stale").map_err(es)?;
+        std::fs::write(dir.join("track_0.wav.new"), b"interrupted").map_err(es)?;
+        p2.save()?;
+        let m1 = std::fs::metadata(&t0p).and_then(|m| m.modified()).map_err(es)?;
+        assert_eq!(m0, m1, "unchanged track was rewritten on save");
+        assert!(!dir.join("track_9.wav").exists() && !dir.join("track_0.wav.new").exists(), "stale files not cleaned");
+        // a changed track IS rewritten and reloads identically
+        let mut v = (*p2.edit.tracks[0].data).clone();
+        v[0] = 1234;
+        p2.edit.tracks[0].data = Arc::new(v);
+        p2.save()?;
+        assert_eq!(Project::load(&dir)?.edit.tracks[0].data[0], 1234, "changed track not saved");
+        // non-finite gain in project.txt is rejected (v1.3.0 accepted NaN and muted the mix)
+        let pt = dir.join("project.txt");
+        let good = std::fs::read_to_string(&pt).map_err(es)?;
+        let bad: String = good.lines().map(|l| if l.starts_with("track=") {
+            let mut f: Vec<&str> = l.split('|').collect(); f[1] = "NaN"; f.join("|") } else { l.to_string() } + "\n").collect();
+        std::fs::write(&pt, bad).map_err(es)?;
+        assert!(Project::load(&dir).is_err(), "NaN gain accepted");
+        std::fs::write(&pt, good).map_err(es)?;
+        assert_eq!(fmt_time(30 * 3600, 30), "1:00:00.00");
+        assert_eq!(fmt_time(30 * 61, 30), "01:01.00");
+        println!("save: unchanged tracks skipped, stale files cleaned, NaN gain rejected");
+    }
     // --- v1.2.0: compaction keeps every output frame byte-identical
     {
         let (cs, before, after) = p2.src.compact(&p2.edit, &AtomicU32::new(0))?;
@@ -4285,9 +4541,29 @@ fn selftest(out: &Path, secs: f64, full: bool, sys: bool) -> Res<()> {
     }
     let mkv = out.join("selftest.mkv");
     let t1 = Instant::now();
-    export_mkv(&mkv, &src, &p2.edit, &AtomicU32::new(0), &AtomicBool::new(false))?;
+    export_mkv(&mkv, &src, &p2.edit, &AtomicU32::new(0), &AtomicBool::new(false), (0, 1000))?;
     println!("export {} ({} bytes) in {:.3}s", mkv.display(), std::fs::metadata(&mkv).map_err(es)?.len(), t1.elapsed().as_secs_f64());
-    export_wav(&out.join("selftest.wav"), &src, &p2.edit)?;
+    export_wav(&out.join("selftest.wav"), &src, &p2.edit, &AtomicU32::new(0), &AtomicBool::new(false))?;
+    // v1.3.1: a cancelled WAV export leaves neither the target nor its temp file behind
+    {
+        let cw = out.join("selftest_cancel.wav");
+        assert!(export_wav(&cw, &src, &p2.edit, &AtomicU32::new(0), &AtomicBool::new(true)).is_err());
+        assert!(!cw.exists() && !cw.with_extension("wav.tmp").exists(), "cancelled export left files");
+        let cm = out.join("selftest_cancel.mkv");
+        assert!(export_mkv(&cm, &src, &p2.edit, &AtomicU32::new(0), &AtomicBool::new(true), (0, 1000)).is_err());
+        assert!(!cm.exists() && !cm.with_extension("mkv.part").exists(), "cancelled MKV left files");
+    }
+    // v1.3.1: ffmpeg runs as a polled, cancellable child with -progress (when installed)
+    if let Some(ff) = find_ffmpeg() {
+        let dur_us = p2.edit.total() as u64 * 1_000_000 / fps as u64;
+        let (mov, pg) = (out.join("selftest.mov"), AtomicU32::new(0));
+        ffmpeg_convert(&ff, &mkv, &mov, true, dur_us, &pg, &AtomicBool::new(false), (500, 1000))?;
+        assert!(std::fs::metadata(&mov).map(|m| m.len() > 1000).unwrap_or(false) && pg.load(Relaxed) == 1000, "MOV remux failed");
+        let mp4 = out.join("selftest_cancel.mp4");
+        assert!(ffmpeg_convert(&ff, &mkv, &mp4, false, dur_us, &pg, &AtomicBool::new(true), (0, 1000)).is_err());
+        assert!(!mp4.exists(), "cancelled ffmpeg left output");
+        println!("ffmpeg: MOV remux ok, cancel kills the child and removes output");
+    }
     let (ch, d) = decode_audio(&out.join("selftest.wav"))?;
     assert_eq!(ch, 2);
     assert_eq!(d.len() / 2, p2.edit.total() as usize * spf);
@@ -4350,14 +4626,7 @@ fn main() {
     }
     if let Some(p) = args.get(1).filter(|p| !p.starts_with('-')) {
         match Project::load(Path::new(p)) {
-            Ok(pr) => {
-                let mut s = app_state.borrow_mut();
-                let n = pr.edit.total();
-                s.proj = Some(pr);
-                s.zoom = (ui.timeline.w() as f64 / n.max(1) as f64).max(1e-4);
-                s.after_edit();
-                s.seek(0);
-            }
+            Ok(pr) => app_state.borrow_mut().set_project(Some(pr), ui.timeline.w()), // v1.3.1: one code path
             Err(e) => app_state.borrow_mut().status = format!("Open failed: {e}"),
         }
         refresh(&app_state, &ui);
